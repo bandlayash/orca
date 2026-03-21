@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dolphin Web</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="container">
+    <h1>Dolphin Web</h1>
+    <div id="controls">
+      <label for="rom-input" id="rom-label">Select a WBFS file</label>
+      <input type="file" id="rom-input" accept=".wbfs,.iso,.gcm,.gcz,.rvz,.wia,.dol,.elf" disabled>
+    </div>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="status">Loading Dolphin&hellip;</div>
+  </div>
+  <script src="main.js"></script>
+  <script src="dolphin.js"></script>
+</body>
+</html>

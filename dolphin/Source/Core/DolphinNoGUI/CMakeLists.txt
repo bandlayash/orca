@@ -1,0 +1,92 @@
+add_executable(dolphin-nogui
+  Platform.cpp
+  Platform.h
+  PlatformHeadless.cpp
+  MainNoGUI.cpp
+)
+
+if(X11_FOUND)
+  target_sources(dolphin-nogui PRIVATE PlatformX11.cpp)
+  target_link_libraries(dolphin-nogui PRIVATE PkgConfig::XRANDR PkgConfig::X11)
+endif()
+
+if(WIN32)
+  target_sources(dolphin-nogui PRIVATE PlatformWin32.cpp)
+endif()
+
+if(APPLE)
+  target_sources(dolphin-nogui PRIVATE PlatformMacos.mm)
+  target_compile_options(dolphin-nogui PRIVATE -fobjc-arc)
+endif()
+
+if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+  target_sources(dolphin-nogui PRIVATE PlatformFBDev.cpp)
+endif()
+
+if(EMSCRIPTEN)
+  target_sources(dolphin-nogui PRIVATE PlatformWeb.cpp)
+  target_link_options(dolphin-nogui PRIVATE
+    "SHELL:-sWASM=1"
+    "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS']"
+    "SHELL:-sEXPORTED_FUNCTIONS=['_main','_dolphin_load_rom']"
+    "SHELL:-sALLOW_MEMORY_GROWTH=1"
+    "SHELL:-sINITIAL_MEMORY=268435456"
+    "SHELL:-sMAXIMUM_MEMORY=2147483648"
+    "SHELL:-sFORCE_FILESYSTEM=1"
+    "SHELL:-sMAX_WEBGL_VERSION=2"
+    "SHELL:-sOFFSCREEN_FRAMEBUFFER=1"
+    -pthread
+    "SHELL:-sPTHREAD_POOL_SIZE=16"
+    "SHELL:-sEXIT_RUNTIME=0"
+    "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/Data/Sys@/dolphin-data/Sys"
+  )
+  set_target_properties(dolphin-nogui PROPERTIES
+    OUTPUT_NAME dolphin
+    SUFFIX .js
+  )
+endif()
+
+if (WIN32)
+  target_sources(dolphin-nogui PRIVATE DolphinNoGUI.exe.manifest DolphinNoGUI.rc)
+
+  set_target_properties(dolphin-nogui PROPERTIES
+    DEBUG_POSTFIX    D
+    OUTPUT_NAME      DolphinNoGUI
+  )
+elseif(NOT EMSCRIPTEN)
+  set_target_properties(dolphin-nogui PROPERTIES OUTPUT_NAME dolphin-emu-nogui)
+endif()
+
+target_link_libraries(dolphin-nogui
+PRIVATE
+  core
+  uicommon
+  cpp-optparse
+)
+
+if(APPLE)
+  target_link_libraries(dolphin-nogui
+    PRIVATE
+      ${APPKIT_LIBRARY}
+      ${COREFOUNDATION_LIBRARY}
+      ${IOK_LIBRARY}
+  )
+endif()
+
+if(WIN32)
+  # needed for adjusting window decorations with DwmSetWindowAttribute
+  target_link_libraries(dolphin-nogui PRIVATE dwmapi.lib)
+endif()
+
+if(MSVC)
+  # Add precompiled header
+  target_link_libraries(dolphin-nogui PRIVATE use_pch)
+endif()
+
+if(USE_DISCORD_PRESENCE)
+  target_compile_definitions(dolphin-nogui PRIVATE -DUSE_DISCORD_PRESENCE)
+endif()
+
+set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} dolphin-nogui)
+install(TARGETS dolphin-nogui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+

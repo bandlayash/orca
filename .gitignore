@@ -1,0 +1,32 @@
+# Build artifacts
+build-wasm/
+dist/
+
+# Emscripten SDK (large, cloned separately)
+emsdk/
+
+# ROM files
+*.wbfs
+*.iso
+*.gcm
+*.wad
+
+# Playwright venv
+.venv-capture/
+
+# Logs
+/tmp/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Claude Code
+.claude/

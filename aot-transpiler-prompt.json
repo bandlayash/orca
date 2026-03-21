@@ -1,0 +1,157 @@
+{
+  "task": "Iteratively build a PPC-to-WASM AOT transpiler for Dolphin-WebAssembly that replaces the Cached Interpreter hot path, until Super Paper Mario (R8PE01) reaches the title screen.",
+  "setup": {
+    "description": "Run these once before starting the loop. They clone dependencies and install tools.",
+    "steps": [
+      {
+        "action": "Clone emsdk if missing",
+        "command": "if [ ! -d emsdk ]; then git clone https://github.com/nicengi/emsdk.git && cd emsdk && ./emsdk install 4.0.3 && ./emsdk activate 4.0.3 && cd ..; fi"
+      },
+      {
+        "action": "Clone dolphin if missing",
+        "command": "if [ ! -d dolphin ]; then git clone https://github.com/bandlayash/orca.git temp-clone && cp -r temp-clone/dolphin . && rm -rf temp-clone; fi"
+      },
+      {
+        "action": "Install build tools",
+        "command": "which ninja >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y ninja-build cmake python3)"
+      },
+      {
+        "action": "Place ROM",
+        "description": "Ensure a Super Paper Mario WBFS is available. Set ROM_PATH below to its location.",
+        "env": {
+          "ROM_PATH": "/path/to/Super Paper Mario [R8PE01].wbfs"
+        }
+      },
+      {
+        "action": "Set up capture venv",
+        "command": "python3 -m venv .venv-capture && .venv-capture/bin/pip install playwright -q && .venv-capture/bin/python -m playwright install chromium"
+      }
+    ]
+  },
+  "your_loop": [
+    {
+      "step": 1,
+      "action": "Implement / improve the AOT transpiler",
+      "details": [
+        "Phase 1 (first iteration): scaffold the transpiler module. Create Source/Core/Core/PowerPC/AotWasm/AotWasm.cpp|h that plugs into JitInterface alongside the CachedInterpreter.",
+        "Phase 2 (early iterations): implement the core PPC instruction subset. Use Jit64 and JitArm64 as reference for semantics. Start with: integer ALU (add/sub/and/or/xor/shift/rotate/cmp), loads/stores (lbz/lhz/lwz/stb/sth/stw and indexed variants), branch (b/bc/bclr/bcctr), CR ops, system (mfspr/mtspr/mfcr/mtcrf).",
+        "Phase 3 (mid iterations): add floating point (single + double), paired singles (ps_*), and less common integer ops as games need them.",
+        "Phase 4 (late iterations): optimize — batch-compile blocks into larger WASM modules, cache compiled modules in IndexedDB, tune block sizes."
+      ]
+    },
+    {
+      "step": 2,
+      "action": "Build",
+      "context": "Run from the repo root directory.",
+      "command": "EMSDK=$(pwd)/emsdk bash build.sh"
+    },
+    {
+      "step": 3,
+      "action": "Serve + Capture",
+      "command": "fuser -k 8080/tcp 2>/dev/null; sleep 1; python3 serve.py & sleep 1; python3 capture.py \"$ROM_PATH\" /tmp/dolphin_browser.log 180",
+      "post_action": "Read /tmp/dolphin_browser.log after it exits."
+    },
+    {
+      "step": 4,
+      "action": "Analyze",
+      "details": [
+        "If crash: use the WASM stack trace analysis workflow (wasm-dis, find function, decode strings, identify root cause). The wasm-dis tool is at emsdk/upstream/bin/wasm-dis.",
+        "If no crash but slow: check which PPC instructions are still falling back to the interpreter (add logging counters to the fallback path).",
+        "If running faster: note the improvement and move to the next phase."
+      ]
+    },
+    {
+      "step": 5,
+      "action": "Fix or extend, then go to step 2."
+    }
+  ],
+  "architecture": {
+    "overview": "The AOT transpiler converts PPC basic blocks into WASM function bodies at ROM load time. It reuses Dolphin's existing PPCAnalyst for block discovery and analysis. Compiled blocks are stored as WebAssembly.Module objects and called from a thin dispatcher that replaces the CachedInterpreter's ExecuteOneBlock().",
+    "key_design_decisions": [
+      "Each PPC block compiles to one exported WASM function. The function signature is: (ppc_state_ptr: i32) -> void. It reads/writes PPC registers via loads/stores to the ppc_state struct in linear memory.",
+      "Use Emscripten's EM_ASM or a JS helper to call WebAssembly.compile() synchronously (via Atomics.wait on a worker thread) at block-compile time. Cache the result so each block is compiled only once.",
+      "Fallback: any unimplemented PPC instruction falls back to calling the interpreter's single-instruction handler for that opcode. This means you can boot games with a partial instruction set.",
+      "Block invalidation: hook into Dolphin's existing ICBI (instruction cache block invalidate) handler. When a block is invalidated, discard the compiled WASM module and let it recompile on next execution.",
+      "Register mapping: PPC GPRs (r0-r31), FPRs (f0-f31), CR, LR, CTR, XER are all fields in PowerPCState. Access them as i32.load/i32.store at known offsets from the ppc_state pointer.",
+      "Memory access: PPC loads/stores go through Dolphin's existing ReadFromHardware/WriteToHardware (or the fastmem path). Call these as imported WASM functions."
+    ],
+    "files_to_create": [
+      "dolphin/Source/Core/Core/PowerPC/AotWasm/AotWasm.h — class declaration, inherits JitBase",
+      "dolphin/Source/Core/Core/PowerPC/AotWasm/AotWasm.cpp — block compiler, dispatcher, instruction emitters",
+      "dolphin/Source/Core/Core/PowerPC/AotWasm/WasmEmitter.h/cpp — helper to build WASM binary format (type section, function section, code section, export section)",
+      "dolphin/Source/Core/Core/PowerPC/AotWasm/WasmBlockCache.h/cpp — caches compiled WebAssembly.Module objects per block address"
+    ],
+    "files_to_modify": [
+      "dolphin/Source/Core/Core/PowerPC/JitInterface.cpp — add case for CPUCore::AotWasm in InitJitCore()",
+      "dolphin/Source/Core/Core/PowerPC/PowerPC.h — add AotWasm to CPUCore enum",
+      "dolphin/Source/Core/Core/PowerPC/PowerPC.cpp — add to AvailableCPUCores() and DefaultCPUCore() under __EMSCRIPTEN__",
+      "dolphin/Source/Core/Core/CMakeLists.txt — add AotWasm source files",
+      "dolphin/Source/Core/DolphinNoGUI/PlatformWeb.cpp — switch MAIN_CPU_CORE to CPUCore::AotWasm"
+    ]
+  },
+  "reference_implementations": {
+    "cached_interpreter": {
+      "block_dispatch": "dolphin/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp:55-88 (ExecuteOneBlock)",
+      "run_loop": "dolphin/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp:90-106 (Run)",
+      "block_compilation": "dolphin/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp (Jit method)"
+    },
+    "jit64_instruction_handlers": "dolphin/Source/Core/Core/PowerPC/Jit64/ — use as reference for what each PPC instruction does",
+    "ppc_tables": "dolphin/Source/Core/Core/PowerPC/Interpreter/InterpreterTables.cpp — maps PPC opcodes to handler functions",
+    "interpreter_handlers": "dolphin/Source/Core/Core/PowerPC/Interpreter/Interpreter_*.cpp — canonical implementation of each PPC instruction",
+    "ppc_state_struct": "dolphin/Source/Core/Core/PowerPC/Gekko.h — PowerPCState struct layout (register offsets)",
+    "block_analysis": "dolphin/Source/Core/Core/PowerPC/PPCAnalyst.h/cpp — block boundary detection, instruction analysis"
+  },
+  "wasm_binary_format_cheatsheet": {
+    "description": "The transpiler builds raw WASM binary modules in memory. Here's the minimal structure:",
+    "sections": [
+      "Magic + version: \\x00asm\\x01\\x00\\x00\\x00",
+      "Type section (id=1): declare function signatures. Main sig: (i32) -> () for block functions.",
+      "Import section (id=2): import memory read/write helpers from the host environment.",
+      "Function section (id=3): list of type indices for each function.",
+      "Export section (id=7): export the block function by name.",
+      "Code section (id=10): the actual WASM bytecode for each function body.",
+      "All integers are LEB128-encoded."
+    ],
+    "key_wasm_opcodes": {
+      "local.get": "0x20",
+      "i32.load": "0x28 (alignment) (offset)",
+      "i32.store": "0x36 (alignment) (offset)",
+      "i32.const": "0x41 (sleb128 value)",
+      "i32.add": "0x6a",
+      "i32.sub": "0x6b",
+      "i32.and": "0x71",
+      "i32.or": "0x72",
+      "i32.xor": "0x73",
+      "i32.shl": "0x74",
+      "i32.shr_u": "0x76",
+      "i32.shr_s": "0x75",
+      "i32.eq": "0x46",
+      "i32.lt_s": "0x48",
+      "i32.gt_s": "0x4a",
+      "call": "0x10 (func_index)",
+      "br_if": "0x0d (label)",
+      "block": "0x02 0x40 (void block)",
+      "end": "0x0b",
+      "return": "0x0f"
+    }
+  },
+  "context": [
+    "Build: EMSDK=$(pwd)/emsdk bash build.sh",
+    "Serve: python3 serve.py (port 8080, adds COOP/COEP headers for SharedArrayBuffer)",
+    "Capture: python3 capture.py (headless Chromium via Playwright, auto-installs into .venv-capture)",
+    "The CachedInterpreter currently runs at ~2-3% of native Wii speed in WASM. The AOT goal is 10-30%+ which should be enough to boot to the title screen.",
+    "PowerPCState struct offsets can be determined by reading Gekko.h. Key fields: gpr[32] (general regs), ps[32] (paired singles / FPRs), pc, npc, cr (condition register), msr, spr[] (special purpose regs including LR=spr[8], CTR=spr[9], XER=spr[1]).",
+    "PPC is big-endian. WASM memory is little-endian. All memory accesses must byte-swap. Dolphin's existing memory read/write functions handle this.",
+    "Start with the interpreter fallback for every instruction, then replace the hottest ones (loads, stores, integer ALU, branches) with direct WASM emission. Profile which opcodes dominate execution and prioritize those.",
+    "WebAssembly.compile() is async in browsers. On a worker thread you can use WebAssembly.compileSync() or block with Atomics.wait + postMessage pattern. Alternatively, build WASM modules on the JS side and pass function pointers back to C++ via Emscripten's addFunction/dynCall.",
+    "All data segments are passive (Emscripten pthreads build). For WASM crash analysis: wasm-dis is at emsdk/upstream/bin/wasm-dis. String decoding: find which segment covers address A via memory.init in WAT, then extract raw bytes at offset (A - segment_memory_base) from the WASM binary."
+  ],
+  "continuation_condition": "Keep iterating until Super Paper Mario boots to the title screen (showing the game logo), or until you've implemented 50+ PPC instructions and the game is visibly progressing faster. No user input needed between iterations.",
+  "important_notes": [
+    "The fallback-to-interpreter strategy is critical. Do NOT try to implement all PPC instructions before testing. Get the scaffolding + dispatcher working first with 100% fallback, verify it boots, then incrementally replace instructions with WASM codegen.",
+    "The WASM binary builder is the most error-prone part. Validate generated modules by logging them and testing with wasm-validate if builds fail at runtime.",
+    "Reuse PPCAnalyst and the existing block cache infrastructure as much as possible. Don't reinvent block discovery.",
+    "Measure performance: add a simple FPS or IPS (instructions per second) counter to the console output so you can see if each iteration actually improves speed.",
+    "The dolphin/ subdirectory is a modified fork — changes go there directly, not to upstream."
+  ]
+}

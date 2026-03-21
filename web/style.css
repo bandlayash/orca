@@ -1,0 +1,62 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #181818;
+  color: #e0e0e0;
+  font-family: system-ui, -apple-system, sans-serif;
+  display: flex;
+  justify-content: center;
+  padding: 2rem;
+}
+
+#container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  max-width: 700px;
+  width: 100%;
+}
+
+h1 {
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+
+#controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+#rom-label {
+  font-size: 0.9rem;
+  color: #aaa;
+}
+
+#rom-input {
+  font-size: 0.9rem;
+  color: #e0e0e0;
+}
+
+#rom-input:disabled {
+  opacity: 0.4;
+}
+
+canvas {
+  width: 640px;
+  height: 480px;
+  background: #000;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  border: 1px solid #333;
+}
+
+#status {
+  font-size: 0.85rem;
+  color: #888;
+}
