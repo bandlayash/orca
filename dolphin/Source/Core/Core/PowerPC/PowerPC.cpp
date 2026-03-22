@@ -233,6 +233,9 @@ std::span<const CPUCore> AvailableCPUCores()
 #elif defined(_M_ARM_64)
       CPUCore::JITARM64,
 #endif
+#ifdef __EMSCRIPTEN__
+      CPUCore::AotWasm,
+#endif
       CPUCore::CachedInterpreter,
       CPUCore::Interpreter,
   };
@@ -246,6 +249,8 @@ CPUCore DefaultCPUCore()
   return CPUCore::JIT64;
 #elif defined(_M_ARM_64)
   return CPUCore::JITARM64;
+#elif defined(__EMSCRIPTEN__)
+  return CPUCore::AotWasm;
 #else
   return CPUCore::CachedInterpreter;
 #endif

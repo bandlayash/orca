@@ -96,6 +96,12 @@ private:
   GLuint m_buffer_name;
   size_t m_buffer_size;
   GLsync m_fence = nullptr;
+#ifdef __EMSCRIPTEN__
+  // WebGL 2 does not support glMapBufferRange for reading (GL_MAP_READ_BIT is
+  // disallowed).  We allocate a client-side shadow buffer and use
+  // glGetBufferSubData / glBufferSubData instead.
+  char* m_cpu_buffer = nullptr;
+#endif
 };
 
 class OGLFramebuffer final : public AbstractFramebuffer

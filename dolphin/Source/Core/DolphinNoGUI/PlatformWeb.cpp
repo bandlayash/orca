@@ -12,6 +12,7 @@
 #include "Core/BootManager.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
+#include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
 #include "Core/Core.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -52,6 +53,7 @@ void PlatformWeb::MainLoop()
 
 WindowSystemInfo PlatformWeb::GetWindowSystemInfo() const
 {
+  std::fprintf(stderr, "[orca] GetWindowSystemInfo: type=Headless\n");
   WindowSystemInfo wsi;
   wsi.type = WindowSystemType::Headless;
   wsi.display_connection = nullptr;
@@ -81,10 +83,23 @@ std::unique_ptr<Platform> Platform::CreateWebPlatform()
 
   Common::RegisterMsgAlertHandler(WebMsgAlertHandler);
 
+  return platform;
+}
+
+// Apply web-specific config overrides.  MUST be called AFTER UICommon::Init()
+// so that Config::Init() has created the Base layer and the config system is
+// ready to accept SetBase() calls.
+void Platform::ApplyWebConfigOverrides()
+{
+  std::fprintf(stderr, "[orca] ApplyWebConfigOverrides: setting web defaults\n");
+
   // Force settings appropriate for the web environment.
-  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::CachedInterpreter);
+  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::AotWasm);
   Config::SetBase(Config::MAIN_DSP_HLE, true);
   Config::SetBase(Config::MAIN_SKIP_IPL, true);
+
+  // Force OGL backend (maps to WebGL on Emscripten).
+  Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("OGL"));
 
   // Reduce GPU workload: native resolution, no MSAA/SSAA, fast depth.
   Config::SetBase(Config::GFX_EFB_SCALE, 1);
@@ -104,22 +119,42 @@ std::unique_ptr<Platform> Platform::CreateWebPlatform()
                   ShaderCompilationMode::Synchronous);
   Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, false);
 
-  return platform;
+  // Force single-core mode (CPU and GPU on same thread).
+  Config::SetBase(Config::MAIN_CPU_THREAD, false);
+  Config::SetBase(Config::MAIN_SYNC_ON_SKIP_IDLE, true);
+
+  // Re-activate the video backend now that we have overridden MAIN_GFX_BACKEND.
+  VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
+  std::fprintf(stderr, "[orca] ApplyWebConfigOverrides: video backend set to %s\n",
+               Config::Get(Config::MAIN_GFX_BACKEND).c_str());
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE int dolphin_load_rom(const char* path)
 {
+  std::fprintf(stderr, "[orca] dolphin_load_rom: path=%s\n", path);
   auto boot = BootParameters::GenerateFromFile(
       std::string(path), BootSessionData(std::nullopt, DeleteSavestateAfterBoot::No));
   if (!boot)
     return -1;
+  std::fprintf(stderr, "[orca] dolphin_load_rom: boot params created\n");
 
   if (!s_web_platform)
     return -3;
 
+  // Safety-critical overrides: use SetCurrent (CurrentRun layer) so that game INIs
+  // loaded during BootCore cannot override them.  Game INIs sit at GlobalGame/LocalGame
+  // layers which are lower priority than CurrentRun.  Without this, a game INI that
+  // sets CPUThread=True would enable dual-core mode, spawning a separate GPU thread
+  // whose proxied WebGL calls deadlock against the main thread under Emscripten.
+  Config::SetCurrent(Config::MAIN_CPU_THREAD, false);
+  Config::SetCurrent(Config::MAIN_GFX_BACKEND, std::string("OGL"));
+  Config::SetCurrent(Config::MAIN_CPU_CORE, PowerPC::CPUCore::AotWasm);
+  Config::SetCurrent(Config::MAIN_DSP_HLE, true);
+
   const WindowSystemInfo wsi = s_web_platform->GetWindowSystemInfo();
   if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot), wsi))
     return -2;
+  std::fprintf(stderr, "[orca] dolphin_load_rom: BootCore returned successfully\n");
 
   return 0;
 }

@@ -49,6 +49,8 @@ public:
 
 #ifdef __EMSCRIPTEN__
   static std::unique_ptr<Platform> CreateWebPlatform();
+  // Apply web-specific config overrides.  Must be called AFTER UICommon::Init().
+  static void ApplyWebConfigOverrides();
 #endif
 
 protected:

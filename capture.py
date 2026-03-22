@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROM_PATH  = sys.argv[1] if len(sys.argv) > 1 else "/home/yb/Downloads/Super Paper Mario [R8PE01].wbfs"
 LOG_PATH  = sys.argv[2] if len(sys.argv) > 2 else "/tmp/dolphin_browser.log"
-TIMEOUT   = int(sys.argv[3]) if len(sys.argv) > 3 else 90
+TIMEOUT   = int(sys.argv[3]) if len(sys.argv) > 3 else 180
 PORT      = 8080
 
 
@@ -70,14 +70,29 @@ async def capture():
         logs.append(line)
         print(line, flush=True)
 
-    def on_console(msg):
+    async def on_console(msg):
         log(f"[console.{msg.type}] {msg.text}")
+        # Try to extract full argument values (may contain stack traces)
+        try:
+            for i, arg in enumerate(msg.args):
+                val = await arg.json_value()
+                if val and str(val) != msg.text:
+                    log(f"  arg[{i}]: {val}")
+        except Exception:
+            pass
+        loc = msg.location
+        if loc and loc.get("url"):
+            log(f"  at {loc['url']}:{loc.get('lineNumber', '?')}:{loc.get('columnNumber', '?')}")
         # Dolphin worker errors arrive as console warnings from main.js
         if "worker sent an error" in msg.text or "unreachable" in msg.text.lower():
             crash_event.set()
 
     def on_pageerror(err):
-        log(f"[pageerror] {err}")
+        err_msg = getattr(err, 'message', str(err))
+        err_stack = getattr(err, 'stack', '')
+        log(f"[pageerror] {err_msg}")
+        if err_stack:
+            log(f"[pageerror-stack] {err_stack}")
         crash_event.set()
 
     def on_worker(worker):
@@ -124,6 +139,13 @@ async def capture():
             await asyncio.wait_for(crash_event.wait(), timeout=TIMEOUT)
             log("=== CRASH DETECTED ===")
             exit_code = 1
+            # Capture screenshot on crash
+            try:
+                screenshot_path = LOG_PATH.replace(".log", "_crash.png")
+                await page.screenshot(path=screenshot_path, full_page=True)
+                log(f"Screenshot saved to {screenshot_path}")
+            except Exception as e:
+                log(f"Screenshot failed: {e}")
         except asyncio.TimeoutError:
             log(f"=== TIMEOUT ({TIMEOUT}s) — no crash detected, game may be running ===")
             exit_code = 0

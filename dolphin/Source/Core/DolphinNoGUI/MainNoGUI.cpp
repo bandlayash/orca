@@ -192,19 +192,38 @@ static std::unique_ptr<Platform> GetPlatform([[maybe_unused]] const optparse::Va
 
 int main()
 {
+  fprintf(stderr, "[orca] main: starting Emscripten build\n");
+
+  // 1. Create the platform (registers msg handler, but does NOT touch Config).
   s_platform = Platform::CreateWebPlatform();
   if (!s_platform || !s_platform->Init())
+  {
+    fprintf(stderr, "[orca] main: platform creation/init failed\n");
     return 1;
+  }
+  fprintf(stderr, "[orca] main: platform created\n");
 
+  // 2. Initialise the config system, logging, and video backend selection.
+  //    This calls Config::Init() internally, creating the Base layer.
   UICommon::SetUserDirectory("/dolphin-user");
   UICommon::Init();
+  fprintf(stderr, "[orca] main: UICommon initialized\n");
+
+  // 3. Now that the config system is live, apply web-specific overrides
+  //    (CPU core, video backend, GFX hacks, etc.) and re-activate the OGL backend.
+  Platform::ApplyWebConfigOverrides();
+
   UICommon::InitControllers(s_platform->GetWindowSystemInfo());
 
+  // Signal to JS that Dolphin is ready to accept ROM loads.
   EM_ASM({
     if (Module.onDolphinReady)
       Module.onDolphinReady();
   });
 
+  // 4. Enter the Emscripten main loop (calls emscripten_set_main_loop_arg,
+  //    which yields to the browser -- no code after this line runs until exit).
+  fprintf(stderr, "[orca] main: entering MainLoop\n");
   s_platform->MainLoop();
   return 0;
 }

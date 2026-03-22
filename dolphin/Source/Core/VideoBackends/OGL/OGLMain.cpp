@@ -75,6 +75,61 @@ std::string VideoBackend::GetDisplayName() const
 
 void VideoBackend::InitBackendInfo(const WindowSystemInfo& wsi)
 {
+#ifdef __EMSCRIPTEN__
+  // WebGL 2 capabilities are well-defined (GLES 3.0 subset).
+  // Skip creating a temporary GL context — it conflicts with the real context
+  // created later in Initialize() when both target the same #canvas element.
+  g_backend_info.api_type = APIType::OpenGL;
+  g_backend_info.MaxTextureSize = 4096;
+  g_backend_info.bUsesLowerLeftOrigin = true;
+  g_backend_info.bUsesExplictQuadBuffering = false;
+  g_backend_info.bSupportsExclusiveFullscreen = false;
+  g_backend_info.bSupportsDualSourceBlend = false;
+  g_backend_info.bSupportsPrimitiveRestart = true;
+  g_backend_info.bSupportsGeometryShaders = false;
+  g_backend_info.bSupportsComputeShaders = false;
+  g_backend_info.bSupports3DVision = false;
+  g_backend_info.bSupportsEarlyZ = true;
+  g_backend_info.bSupportsBindingLayout = false;
+  g_backend_info.bSupportsBBox = false;
+  g_backend_info.bSupportsGSInstancing = false;
+  g_backend_info.bSupportsPostProcessing = true;
+  g_backend_info.bSupportsPaletteConversion = true;
+  g_backend_info.bSupportsClipControl = false;
+  g_backend_info.bSupportsSSAA = false;
+  g_backend_info.bSupportsFragmentStoresAndAtomics = false;
+  g_backend_info.bSupportsDepthClamp = false;
+  g_backend_info.bSupportsReversedDepthRange = false;
+  g_backend_info.bSupportsLogicOp = false;
+  g_backend_info.bSupportsMultithreading = false;
+  g_backend_info.bSupportsGPUTextureDecoding = false;
+  g_backend_info.bSupportsST3CTextures = false;
+  g_backend_info.bSupportsCopyToVram = true;
+  g_backend_info.bSupportsBitfield = false;
+  g_backend_info.bSupportsDynamicSamplerIndexing = false;
+  g_backend_info.bSupportsBPTCTextures = false;
+  g_backend_info.bSupportsFramebufferFetch = false;
+  g_backend_info.bSupportsBackgroundCompiling = false;
+  g_backend_info.bSupportsLargePoints = false;
+  g_backend_info.bSupportsPartialDepthCopies = false;
+  g_backend_info.bSupportsDepthReadback = false;
+  g_backend_info.bSupportsShaderBinaries = false;
+  g_backend_info.bSupportsPipelineCacheData = false;
+  g_backend_info.bSupportsCoarseDerivatives = false;
+  g_backend_info.bSupportsTextureQueryLevels = false;
+  g_backend_info.bSupportsLodBiasInSampler = false;
+  g_backend_info.bSupportsSettingObjectNames = false;
+  g_backend_info.bSupportsPartialMultisampleResolve = false;
+  g_backend_info.bSupportsDynamicVertexLoader = false;
+  g_backend_info.bSupportsVSLinePointExpand = false;
+  g_backend_info.bSupportsGLLayerInFS = false;
+  g_backend_info.bSupportsHDROutput = false;
+  g_backend_info.bSupportsUnrestrictedDepthRange = false;
+  g_backend_info.AAModes = {1};
+  g_backend_info.Adapters.clear();
+  return;
+#endif
+
   std::unique_ptr<GLContext> temp_gl_context =
       GLContext::Create(wsi, g_Config.stereo_mode == StereoMode::QuadBuffer, true, false,
                         Config::Get(Config::GFX_PREFER_GLES));

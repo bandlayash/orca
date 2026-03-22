@@ -10,7 +10,7 @@
 #include "Common/GL/GLContext.h"
 #include "Common/Logging/Log.h"
 
-#if defined(__linux__) || defined(__APPLE__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
 #include <dlfcn.h>
 #endif
 
@@ -2433,7 +2433,7 @@ static void* GetFuncAddress(GLContext* context, const std::string& name, void** 
   *func = context->GetFuncAddress(name);
   if (*func == nullptr)
   {
-#if defined(__linux__) || defined(__APPLE__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     // Give it a second try with dlsym
     *func = dlsym(RTLD_NEXT, name.c_str());
 #endif

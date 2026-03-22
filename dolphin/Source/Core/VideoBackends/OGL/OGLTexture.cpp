@@ -418,12 +418,19 @@ OGLStagingTexture::~OGLStagingTexture()
 {
   if (m_fence != nullptr)
     glDeleteSync(m_fence);
+#ifdef __EMSCRIPTEN__
+  // Client-side shadow buffer — no GL unmap needed.
+  delete[] m_cpu_buffer;
+  m_cpu_buffer = nullptr;
+  m_map_pointer = nullptr;
+#else
   if (m_map_pointer)
   {
     glBindBuffer(GL_PIXEL_PACK_BUFFER, m_buffer_name);
     glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
   }
+#endif
   if (m_buffer_name != 0)
     glDeleteBuffers(1, &m_buffer_name);
 }
@@ -494,6 +501,41 @@ void OGLStagingTexture::CopyFromTexture(const AbstractTexture* src,
   if (!UsePersistentStagingBuffers())
     OGLStagingTexture::Unmap();
 
+#ifdef __EMSCRIPTEN__
+  // WebGL 2 does not support glGetBufferSubData, so we cannot use a PBO for
+  // readback.  Instead, read directly into the client-side shadow buffer via
+  // glReadPixels with no PBO bound (offset interpreted as a real pointer).
+  // Depth readback is not supported (bSupportsDepthReadback == false on ES).
+  if (!m_cpu_buffer)
+    m_cpu_buffer = new char[m_buffer_size];
+
+  const OGLTexture* gltex = static_cast<const OGLTexture*>(src);
+  const size_t dst_offset = dst_rect.top * m_config.GetStride() + dst_rect.left * m_texel_size;
+
+  // Ensure no PBO is bound so glReadPixels writes to client memory.
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  glPixelStorei(GL_PACK_ROW_LENGTH, m_config.width);
+
+  GetOGLGfx()->BindSharedReadFramebuffer();
+  if (AbstractTexture::IsDepthFormat(gltex->GetFormat()))
+  {
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, gltex->GetGLTextureId(),
+                              src_level, src_layer);
+  }
+  else
+  {
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, gltex->GetGLTextureId(),
+                              src_level, src_layer);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, 0, 0, 0);
+  }
+  glReadPixels(src_rect.left, src_rect.top, src_rect.GetWidth(), src_rect.GetHeight(),
+               GetGLFormatForTextureFormat(src->GetFormat()),
+               GetGLTypeForTextureFormat(src->GetFormat()), m_cpu_buffer + dst_offset);
+  GetOGLGfx()->RestoreFramebufferBinding();
+
+  glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+#else
   // Copy from the texture object to the staging buffer.
   glBindBuffer(GL_PIXEL_PACK_BUFFER, m_buffer_name);
   glPixelStorei(GL_PACK_ROW_LENGTH, m_config.width);
@@ -545,6 +587,7 @@ void OGLStagingTexture::CopyFromTexture(const AbstractTexture* src,
     m_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
   }
+#endif
 
   m_needs_flush = true;
 }
@@ -574,7 +617,12 @@ void OGLStagingTexture::CopyToTexture(const MathUtil::Rectangle<int>& src_rect,
     // Unmap the buffer before writing when not using persistent mappings.
     if (m_map_pointer)
     {
+#ifdef __EMSCRIPTEN__
+      // WebGL 2: flush client-side data to the GPU buffer via glBufferSubData.
+      glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, m_buffer_size, m_cpu_buffer);
+#else
       glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+#endif
       m_map_pointer = nullptr;
     }
   }
@@ -630,6 +678,18 @@ bool OGLStagingTexture::Map()
   if (m_map_pointer)
     return true;
 
+#ifdef __EMSCRIPTEN__
+  // WebGL 2 does not support glMapBufferRange with GL_MAP_READ_BIT and does
+  // not provide glGetBufferSubData.  For readback, CopyFromTexture() already
+  // wrote directly into m_cpu_buffer via glReadPixels (no PBO).  For upload,
+  // we just hand back the client-side buffer; CopyToTexture / Unmap will push
+  // it to the GPU via glBufferSubData.
+  if (!m_cpu_buffer)
+    m_cpu_buffer = new char[m_buffer_size];
+
+  m_map_pointer = m_cpu_buffer;
+  return true;
+#else
   // Slow path, map the texture, unmap it later.
   GLenum flags;
   if (m_type == StagingTextureType::Readback)
@@ -642,6 +702,7 @@ bool OGLStagingTexture::Map()
   m_map_pointer = static_cast<char*>(glMapBufferRange(m_target, 0, m_buffer_size, flags));
   glBindBuffer(m_target, 0);
   return m_map_pointer != nullptr;
+#endif
 }
 
 void OGLStagingTexture::Unmap()
@@ -650,10 +711,22 @@ void OGLStagingTexture::Unmap()
   if (!m_map_pointer || UsePersistentStagingBuffers())
     return;
 
+#ifdef __EMSCRIPTEN__
+  // Upload modified client-side data back to the GPU buffer for write/mutable types.
+  if (m_type == StagingTextureType::Upload || m_type == StagingTextureType::Mutable)
+  {
+    glBindBuffer(m_target, m_buffer_name);
+    glBufferSubData(m_target, 0, m_buffer_size, m_cpu_buffer);
+    glBindBuffer(m_target, 0);
+  }
+  m_map_pointer = nullptr;
+  // Keep m_cpu_buffer allocated for reuse.
+#else
   glBindBuffer(m_target, m_buffer_name);
   glUnmapBuffer(m_target);
   glBindBuffer(m_target, 0);
   m_map_pointer = nullptr;
+#endif
 }
 
 OGLFramebuffer::OGLFramebuffer(AbstractTexture* color_attachment, AbstractTexture* depth_attachment,

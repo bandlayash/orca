@@ -497,6 +497,13 @@ add_library(core
   NetworkCaptureLogger.h
   PatchEngine.cpp
   PatchEngine.h
+  PowerPC/AotWasm/AotWasm.cpp
+  PowerPC/AotWasm/AotWasm.h
+  PowerPC/AotWasm/AotWasm_Disassembler.cpp
+  PowerPC/AotWasm/AotWasmBlockCache.cpp
+  PowerPC/AotWasm/AotWasmBlockCache.h
+  PowerPC/AotWasm/AotWasmEmitter.cpp
+  PowerPC/AotWasm/AotWasmEmitter.h
   PowerPC/BreakPoints.cpp
   PowerPC/BreakPoints.h
   PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp

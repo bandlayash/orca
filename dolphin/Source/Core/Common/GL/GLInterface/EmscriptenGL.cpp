@@ -3,6 +3,8 @@
 
 #include "Common/GL/GLInterface/EmscriptenGL.h"
 
+#include <cstdio>
+
 #include "Common/Logging/Log.h"
 
 GLContextEmscripten::~GLContextEmscripten()
@@ -16,6 +18,7 @@ GLContextEmscripten::~GLContextEmscripten()
 
 bool GLContextEmscripten::Initialize(const WindowSystemInfo& wsi, bool stereo, bool core)
 {
+  std::fprintf(stderr, "[orca-gl] EmscriptenGL::Initialize: creating WebGL2 context on #canvas\n");
   EmscriptenWebGLContextAttributes attrs;
   emscripten_webgl_init_context_attributes(&attrs);
   attrs.majorVersion = 2;  // WebGL 2 = GLES 3.0
@@ -31,8 +34,10 @@ bool GLContextEmscripten::Initialize(const WindowSystemInfo& wsi, bool stereo, b
   attrs.renderViaOffscreenBackBuffer = true;
 
   m_context = emscripten_webgl_create_context("#canvas", &attrs);
+  std::fprintf(stderr, "[orca-gl] EmscriptenGL: context=%lu\n", m_context);
   if (m_context <= 0)
   {
+    std::fprintf(stderr, "[orca-gl] EmscriptenGL: FAILED context=%lu\n", m_context);
     ERROR_LOG_FMT(VIDEO, "EmscriptenGL: Failed to create WebGL 2 context (error {})", m_context);
     m_context = 0;
     return false;
@@ -48,8 +53,15 @@ bool GLContextEmscripten::Initialize(const WindowSystemInfo& wsi, bool stereo, b
   }
 
   m_opengl_mode = Mode::OpenGLES;
-  m_backbuffer_width = 640;
-  m_backbuffer_height = 480;
+
+  // Query the actual drawing-buffer size from the canvas rather than hardcoding 640x480.
+  // This ensures the Presenter and system framebuffer start at the correct resolution.
+  int w = 0, h = 0;
+  emscripten_webgl_get_drawing_buffer_size(m_context, &w, &h);
+  m_backbuffer_width = (w > 0) ? static_cast<u32>(w) : 640;
+  m_backbuffer_height = (h > 0) ? static_cast<u32>(h) : 480;
+  std::fprintf(stderr, "[orca-gl] EmscriptenGL: context current, mode=GLES, %ux%u\n",
+               m_backbuffer_width, m_backbuffer_height);
 
   INFO_LOG_FMT(VIDEO, "EmscriptenGL: WebGL 2 context created ({}x{})", m_backbuffer_width,
                m_backbuffer_height);
@@ -58,12 +70,25 @@ bool GLContextEmscripten::Initialize(const WindowSystemInfo& wsi, bool stereo, b
 
 bool GLContextEmscripten::MakeCurrent()
 {
+  std::fprintf(stderr, "[orca-gl] EmscriptenGL::MakeCurrent\n");
   return emscripten_webgl_make_context_current(m_context) == EMSCRIPTEN_RESULT_SUCCESS;
 }
 
 bool GLContextEmscripten::ClearCurrent()
 {
   return emscripten_webgl_make_context_current(0) == EMSCRIPTEN_RESULT_SUCCESS;
+}
+
+void GLContextEmscripten::Update()
+{
+  // Query the actual canvas drawing-buffer size so the renderer tracks resizes.
+  int w = 0, h = 0;
+  emscripten_webgl_get_drawing_buffer_size(m_context, &w, &h);
+  if (w > 0 && h > 0)
+  {
+    m_backbuffer_width = static_cast<u32>(w);
+    m_backbuffer_height = static_cast<u32>(h);
+  }
 }
 
 void GLContextEmscripten::Swap()

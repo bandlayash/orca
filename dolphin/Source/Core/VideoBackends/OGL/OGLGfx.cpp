@@ -319,17 +319,23 @@ void OGLGfx::DispatchComputeShader(const AbstractShader* shader, u32 groupsize_x
 
 void OGLGfx::SelectLeftBuffer()
 {
-  glDrawBuffer(GL_BACK_LEFT);
+  // glDrawBuffer is not available in GLES/WebGL 2.
+  if (!IsGLES())
+    glDrawBuffer(GL_BACK_LEFT);
 }
 
 void OGLGfx::SelectRightBuffer()
 {
-  glDrawBuffer(GL_BACK_RIGHT);
+  // glDrawBuffer is not available in GLES/WebGL 2.
+  if (!IsGLES())
+    glDrawBuffer(GL_BACK_RIGHT);
 }
 
 void OGLGfx::SelectMainBuffer()
 {
-  glDrawBuffer(GL_BACK);
+  // glDrawBuffer is not available in GLES/WebGL 2.
+  if (!IsGLES())
+    glDrawBuffer(GL_BACK);
 }
 
 void OGLGfx::SetFramebuffer(AbstractFramebuffer* framebuffer)

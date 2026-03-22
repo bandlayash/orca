@@ -412,6 +412,13 @@ bool PopulateConfig(GLContext* m_main_gl_context)
       g_ogl_config.bSupportsAEP = false;
       g_ogl_config.bSupportsTextureStorage = true;
       g_backend_info.bSupportsGeometryShaders = false;
+      g_backend_info.bSupportsComputeShaders = false;
+      g_backend_info.bSupportsBindingLayout = false;
+      g_ogl_config.bSupportsImageLoadStore = false;
+      g_backend_info.bSupportsSSAA = false;
+      g_backend_info.bSupportsGSInstancing = false;
+      g_backend_info.bSupportsBitfield = false;
+      g_backend_info.bSupportsDynamicSamplerIndexing = false;
     }
     else if (GLExtensions::Version() == 310)
     {

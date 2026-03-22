@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -516,6 +517,7 @@ static void FifoPlayerThread(Core::System& system, const std::optional<std::stri
 static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot,
                       WindowSystemInfo wsi)
 {
+  std::fprintf(stderr, "[orca] EmuThread: started\n");
   NotifyStateChanged(State::Starting);
   Common::ScopeGuard flag_guard{[] {
     {
@@ -605,12 +607,14 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
 
   // In single-core mode: This holds a video backend shutdown function.
   // In dual-core mode: This holds a GPU thread stopping function (which does the backend shutdown).
+  std::fprintf(stderr, "[orca] EmuThread: initializing video backend\n");
   const auto video_guard = GetInitializedVideoGuard(system, wsi);
   if (!video_guard)
   {
     PanicAlertFmt("Failed to initialize video backend!");
     return;
   }
+  std::fprintf(stderr, "[orca] EmuThread: video backend initialized\n");
 
   if (cpu_info.HTT)
     Config::SetBaseOrCurrent(Config::MAIN_DSP_THREAD, cpu_info.num_cores > 4);
@@ -641,6 +645,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
     savegame_redirect = DiscIO::Riivolution::ExtractSavegameRedirect(boot->riivolution_patches);
 
   {
+    std::fprintf(stderr, "[orca] EmuThread: starting boot\n");
     ASSERT(IsCPUThread());
     CPUThreadGuard guard(system);
     if (!CBoot::BootUp(system, guard, std::move(boot)))
@@ -678,6 +683,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
   UpdateTitle(system);
 
   // Become the CPU thread.
+  std::fprintf(stderr, "[orca] EmuThread: entering CPU loop\n");
   cpu_thread_func(system, savestate_path, delete_savestate);
 }
 
