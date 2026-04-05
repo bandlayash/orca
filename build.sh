@@ -17,7 +17,7 @@ emcmake cmake -S dolphin -B build-wasm -G Ninja \
   -DUSE_SYSTEM_LIBS=OFF \
   -DCMAKE_C_FLAGS="-pthread" \
   -DCMAKE_CXX_FLAGS="-pthread" \
-  -DCMAKE_EXE_LINKER_FLAGS="-sASSERTIONS=2 -sDEMANGLE_SUPPORT=1 -g2 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0"
+  -DCMAKE_EXE_LINKER_FLAGS="-sASSERTIONS=2 -g2 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0"
 
 emmake ninja -C build-wasm dolphin-nogui -j$(nproc)
 

@@ -254,20 +254,20 @@ void ProgramShaderCache::UploadConstants()
     s_buffer->Unmap(s_ubo_buffer_size + custom_constants_size);
 
     glBindBufferRange(GL_UNIFORM_BUFFER, 1, s_buffer->m_buffer, buffer.second,
-                      sizeof(PixelShaderConstants));
+                      Common::AlignUp(sizeof(PixelShaderConstants), s_ubo_align));
     size = Common::AlignUp(sizeof(PixelShaderConstants), s_ubo_align);
     glBindBufferRange(GL_UNIFORM_BUFFER, 2, s_buffer->m_buffer, buffer.second + size,
-                      sizeof(VertexShaderConstants));
+                      Common::AlignUp(sizeof(VertexShaderConstants), s_ubo_align));
     size += Common::AlignUp(sizeof(VertexShaderConstants), s_ubo_align);
 
     if (!pixel_shader_manager.custom_constants.empty())
     {
       glBindBufferRange(GL_UNIFORM_BUFFER, 3, s_buffer->m_buffer, buffer.second + size,
-                        pixel_shader_manager.custom_constants.size());
+                        Common::AlignUp(pixel_shader_manager.custom_constants.size(), s_ubo_align));
       size += Common::AlignUp(pixel_shader_manager.custom_constants.size(), s_ubo_align);
     }
     glBindBufferRange(GL_UNIFORM_BUFFER, 4, s_buffer->m_buffer, buffer.second + size,
-                      sizeof(GeometryShaderConstants));
+                      Common::AlignUp(sizeof(GeometryShaderConstants), s_ubo_align));
 
     pixel_shader_manager.dirty = false;
     vertex_shader_manager.dirty = false;
@@ -286,9 +286,10 @@ void ProgramShaderCache::UploadConstants(const void* data, u32 data_size)
   std::memcpy(buffer.first, data, data_size);
   s_buffer->Unmap(alloc_size);
 
-  // bind the same sub-buffer to all stages
+  // bind the same sub-buffer to all stages (use aligned size for WebGL2 compatibility)
+  const u32 bind_size = Common::AlignUp(data_size, s_ubo_align);
   for (u32 index = 1; index <= 4; index++)
-    glBindBufferRange(GL_UNIFORM_BUFFER, index, s_buffer->m_buffer, buffer.second, data_size);
+    glBindBufferRange(GL_UNIFORM_BUFFER, index, s_buffer->m_buffer, buffer.second, bind_size);
 
   ADDSTAT(g_stats.this_frame.bytes_uniform_streamed, data_size);
 }

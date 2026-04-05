@@ -11,6 +11,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
 #endif
 
 #ifndef _WIN32
@@ -221,8 +222,17 @@ int main()
       Module.onDolphinReady();
   });
 
-  // 4. Enter the Emscripten main loop (calls emscripten_set_main_loop_arg,
+  // 4. Tell Emscripten that the #canvas OffscreenCanvas may be used by any
+  //    spawned pthread.  When the GPU thread (spawned by GetInitializedVideoGuard
+  //    in Core.cpp) calls emscripten_webgl_create_context("#canvas"), Emscripten
+  //    will automatically transfer the OffscreenCanvas to that thread.
+  //    This requires -sOFFSCREENCANVAS_SUPPORT=1 and -sOFFSCREENCANVASES=['#canvas'].
+  fprintf(stderr, "[orca] main: OffscreenCanvas enabled for #canvas (dual-core GPU thread)\n");
+
+  // 5. Enter the Emscripten main loop (calls emscripten_set_main_loop_arg,
   //    which yields to the browser -- no code after this line runs until exit).
+  //    The main thread stays responsive for input/UI while the CPU and GPU
+  //    threads run the emulation.
   fprintf(stderr, "[orca] main: entering MainLoop\n");
   s_platform->MainLoop();
   return 0;

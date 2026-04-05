@@ -29,9 +29,12 @@ bool GLContextEmscripten::Initialize(const WindowSystemInfo& wsi, bool stereo, b
   attrs.alpha = false;
   attrs.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
   attrs.enableExtensionsByDefault = true;
-  // Allow WebGL context creation from worker threads (GPU thread in dual-core mode).
-  attrs.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_ALWAYS;
-  attrs.renderViaOffscreenBackBuffer = true;
+  // With OffscreenCanvas support (-sOFFSCREENCANVAS_SUPPORT=1), the GPU worker thread
+  // owns the canvas directly, so we must NOT proxy WebGL calls back to the main thread
+  // (that would deadlock).  PROXY_DISALLOW tells Emscripten to create the context on
+  // the calling thread's OffscreenCanvas instead.
+  attrs.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
+  attrs.renderViaOffscreenBackBuffer = false;
 
   m_context = emscripten_webgl_create_context("#canvas", &attrs);
   std::fprintf(stderr, "[orca-gl] EmscriptenGL: context=%lu\n", m_context);

@@ -55,6 +55,7 @@ static constexpr u32 OFF_SPR = PPC_OFF(spr);
 static constexpr u32 OFF_RESERVE = PPC_OFF(reserve);
 static constexpr u32 OFF_RESERVE_ADDR = PPC_OFF(reserve_address);
 static constexpr u32 OFF_FPSCR = PPC_OFF(fpscr);
+static constexpr u32 OFF_XER_STRINGCTRL = PPC_OFF(xer_stringctrl);
 
 // SPR indices
 static constexpr u32 SPR_LR_IDX = 8;
@@ -121,6 +122,8 @@ constexpr u8 I64And = 0x83;
 constexpr u8 I64Xor = 0x85;
 constexpr u8 I64ShrU = 0x88;
 constexpr u8 I64ShrS = 0x87;
+constexpr u8 I64Add = 0x7c;
+constexpr u8 I64Sub = 0x7d;
 constexpr u8 I64Mul = 0x7e;
 constexpr u8 I32WrapI64 = 0xa7;
 constexpr u8 I64Eqz = 0x50;
@@ -154,6 +157,24 @@ constexpr u8 I32 = 0x7f;
 constexpr u8 I64 = 0x7e;
 constexpr u8 F64 = 0x7c;
 constexpr u8 F32 = 0x7d;
+constexpr u8 V128 = 0x7b;
+// SIMD prefix byte: all SIMD opcodes are encoded as 0xFD + LEB128(opcode)
+constexpr u8 SIMDPrefix = 0xfd;
+// SIMD opcode numbers (encoded as LEB128 after the prefix)
+constexpr u32 V128Load = 0x00;
+constexpr u32 V128Store = 0x0b;
+constexpr u32 F64x2ExtractLane = 0x1d;
+constexpr u32 F64x2ReplaceLane = 0x22;
+constexpr u32 F64x2Splat = 0x14;
+constexpr u32 F64x2Abs = 0xec;
+constexpr u32 F64x2Neg = 0xed;
+constexpr u32 F64x2Sqrt = 0xef;
+constexpr u32 F64x2Add = 0xf0;
+constexpr u32 F64x2Sub = 0xf1;
+constexpr u32 F64x2Mul = 0xf2;
+constexpr u32 F64x2Div = 0xf3;
+constexpr u32 F32x4DemoteF64x2Zero = 0x5e;
+constexpr u32 F64x2PromoteLowF32x4 = 0x5f;
 }  // namespace WasmOp
 
 // =====================================================================
@@ -341,8 +362,8 @@ EM_JS(int, aot_wasm_compile, (const uint8_t* bytesPtr, int bytesLen), {
         }
       };
     }
-    var bytes = Module.HEAPU8.subarray(bytesPtr, bytesPtr + bytesLen);
-    var mod = new WebAssembly.Module(bytes);
+    var bytes = Module.HEAPU8.slice(bytesPtr, bytesPtr + bytesLen);
+    var mod = new WebAssembly.Module(bytes.buffer);
     var instance = new WebAssembly.Instance(mod, Module._aotImports);
     if (!Module._aotFuncs)
       Module._aotFuncs = [];
@@ -536,8 +557,9 @@ static constexpr u32 LOCAL_FPR0 = 7;    // f64 temp for FPU operations
 static constexpr u32 LOCAL_FPR1 = 8;    // f64 temp for second FPU operand
 static constexpr u32 LOCAL_GPR_BASE = 9;       // locals 9-40: GPR register cache (32 i32)
 static constexpr u32 LOCAL_CR_BASE = 41;       // locals 41-48: CR field cache (8 i64)
-static constexpr u32 LOCAL_FPR_PS0_BASE = 49;  // locals 49-80: FPR ps0 cache (32 f64, FPU blocks only)
-static constexpr u32 LOCAL_FPR_PS1_BASE = 81;  // locals 81-112: FPR ps1 cache (32 f64, FPU blocks only)
+static constexpr u32 LOCAL_FPR_V128_BASE = 49;  // locals 49-80: FPR v128 cache (32 v128, FPU blocks only)
+static constexpr u32 LOCAL_SIMD_TMP0 = 81;     // v128 temp for SIMD operations
+static constexpr u32 LOCAL_SIMD_TMP1 = 82;     // v128 temp for SIMD operations
 
 // Register Cache (write-back): caches GPR and FPR values in WASM locals.
 // Stores only update the cache local; dirty values are flushed to memory before
@@ -551,11 +573,9 @@ struct GPRCache
   bool is_const[32] = {};    // compile-time: value is known at codegen time
   s32 const_val[32] = {};    // compile-time: the known constant value
 
-  // FPR cache: ps0 and ps1 for each of 32 FPRs
-  bool fpr_ps0_loaded[32] = {};
-  bool fpr_ps1_loaded[32] = {};
-  bool fpr_ps0_dirty[32] = {};
-  bool fpr_ps1_dirty[32] = {};
+  // FPR cache: each FPR stored as a single v128 (ps0 in lane 0, ps1 in lane 1)
+  bool fpr_loaded[32] = {};
+  bool fpr_dirty[32] = {};
 
   // CR field cache: 8 condition register fields (each stored as i64)
   bool cr_loaded[8] = {};
@@ -572,10 +592,8 @@ struct GPRCache
     std::memset(loaded, 0, sizeof(loaded));
     std::memset(dirty, 0, sizeof(dirty));
     std::memset(is_const, 0, sizeof(is_const));
-    std::memset(fpr_ps0_loaded, 0, sizeof(fpr_ps0_loaded));
-    std::memset(fpr_ps1_loaded, 0, sizeof(fpr_ps1_loaded));
-    std::memset(fpr_ps0_dirty, 0, sizeof(fpr_ps0_dirty));
-    std::memset(fpr_ps1_dirty, 0, sizeof(fpr_ps1_dirty));
+    std::memset(fpr_loaded, 0, sizeof(fpr_loaded));
+    std::memset(fpr_dirty, 0, sizeof(fpr_dirty));
     std::memset(cr_loaded, 0, sizeof(cr_loaded));
     std::memset(cr_dirty, 0, sizeof(cr_dirty));
     std::memset(cr_is_const, 0, sizeof(cr_is_const));
@@ -584,10 +602,8 @@ struct GPRCache
   void InvalidateFPR()
   {
     // NOTE: caller must flush dirty FPR registers BEFORE calling this
-    std::memset(fpr_ps0_loaded, 0, sizeof(fpr_ps0_loaded));
-    std::memset(fpr_ps1_loaded, 0, sizeof(fpr_ps1_loaded));
-    std::memset(fpr_ps0_dirty, 0, sizeof(fpr_ps0_dirty));
-    std::memset(fpr_ps1_dirty, 0, sizeof(fpr_ps1_dirty));
+    std::memset(fpr_loaded, 0, sizeof(fpr_loaded));
+    std::memset(fpr_dirty, 0, sizeof(fpr_dirty));
   }
 
   void SetConst(u32 reg, s32 val)
@@ -801,53 +817,121 @@ static void EmitF64Store(std::vector<u8>& code, u32 offset)
   EncodeU32(code, offset);
 }
 
-// Load ps[fpr].ps0 as f64 onto WASM stack (with FPR cache)
+// --- WASM SIMD v128 emit helpers ---
+
+// Emit a SIMD opcode: 0xFD prefix + LEB128 opcode number
+static void EmitSIMDOp(std::vector<u8>& code, u32 opcode)
+{
+  code.push_back(WasmOp::SIMDPrefix);
+  EncodeU32(code, opcode);
+}
+
+// Emit: v128.load offset=<off> align=4 (16-byte aligned)
+static void EmitV128Load(std::vector<u8>& code, u32 offset)
+{
+  EmitSIMDOp(code, WasmOp::V128Load);
+  EncodeU32(code, 4);  // align: log2(16) = 4
+  EncodeU32(code, offset);
+}
+
+// Emit: v128.store offset=<off> align=4
+static void EmitV128Store(std::vector<u8>& code, u32 offset)
+{
+  EmitSIMDOp(code, WasmOp::V128Store);
+  EncodeU32(code, 4);
+  EncodeU32(code, offset);
+}
+
+// Emit: f64x2.extract_lane <lane>  (v128 → f64)
+static void EmitF64x2ExtractLane(std::vector<u8>& code, u8 lane)
+{
+  EmitSIMDOp(code, WasmOp::F64x2ExtractLane);
+  code.push_back(lane);
+}
+
+// Emit: f64x2.replace_lane <lane>  (v128, f64 → v128)
+static void EmitF64x2ReplaceLane(std::vector<u8>& code, u8 lane)
+{
+  EmitSIMDOp(code, WasmOp::F64x2ReplaceLane);
+  code.push_back(lane);
+}
+
+// Emit: f32x4.demote_f64x2_zero then f64x2.promote_low_f32x4  (v128 → v128, rounds both lanes to f32)
+static void EmitF64x2RoundToF32(std::vector<u8>& code)
+{
+  EmitSIMDOp(code, WasmOp::F32x4DemoteF64x2Zero);
+  EmitSIMDOp(code, WasmOp::F64x2PromoteLowF32x4);
+}
+
+// --- FPR cache: v128 (ps0 in lane 0, ps1 in lane 1) ---
+
+// Ensure FPR v128 is loaded into cache. Does NOT push anything onto stack.
+static void EmitEnsureFPRLoaded(std::vector<u8>& code, GPRCache& cache, u32 fpr)
+{
+  if (!cache.fpr_loaded[fpr])
+  {
+    EmitLocalGet(code, LOCAL_STATE);
+    EmitV128Load(code, OFF_PS + fpr * 16);
+    EmitLocalSet(code, LOCAL_FPR_V128_BASE + fpr);
+    cache.fpr_loaded[fpr] = true;
+  }
+}
+
+// Load FPR as full v128 onto WASM stack (both ps0+ps1)
+static void EmitLoadFPRv128(std::vector<u8>& code, GPRCache& cache, u32 fpr)
+{
+  EmitEnsureFPRLoaded(code, cache, fpr);
+  EmitLocalGet(code, LOCAL_FPR_V128_BASE + fpr);
+}
+
+// Store v128 from stack to FPR cache (marks dirty)
+static void EmitSetFPRv128(std::vector<u8>& code, GPRCache& cache, u32 fpr)
+{
+  EmitLocalSet(code, LOCAL_FPR_V128_BASE + fpr);
+  cache.fpr_loaded[fpr] = true;
+  cache.fpr_dirty[fpr] = true;
+}
+
+// Load ps[fpr].ps0 as f64 onto WASM stack (extracts lane 0 from v128 cache)
 static void EmitLoadPS0(std::vector<u8>& code, GPRCache& cache, u32 fpr)
 {
-  if (cache.fpr_ps0_loaded[fpr])
-  {
-    EmitLocalGet(code, LOCAL_FPR_PS0_BASE + fpr);
-  }
-  else
-  {
-    EmitLocalGet(code, LOCAL_STATE);
-    EmitF64Load(code, OFF_PS + fpr * 16);
-    EmitLocalTee(code, LOCAL_FPR_PS0_BASE + fpr);
-    cache.fpr_ps0_loaded[fpr] = true;
-  }
+  EmitEnsureFPRLoaded(code, cache, fpr);
+  EmitLocalGet(code, LOCAL_FPR_V128_BASE + fpr);
+  EmitF64x2ExtractLane(code, 0);
 }
 
-// Store f64 to ps[fpr].ps0 (state_ptr and f64 value must be on stack, write-back)
-// Load ps[fpr].ps1 as f64 onto WASM stack (with FPR cache)
+// Load ps[fpr].ps1 as f64 onto WASM stack (extracts lane 1 from v128 cache)
 static void EmitLoadPS1(std::vector<u8>& code, GPRCache& cache, u32 fpr)
 {
-  if (cache.fpr_ps1_loaded[fpr])
-  {
-    EmitLocalGet(code, LOCAL_FPR_PS1_BASE + fpr);
-  }
-  else
-  {
-    EmitLocalGet(code, LOCAL_STATE);
-    EmitF64Load(code, OFF_PS + fpr * 16 + 8);
-    EmitLocalTee(code, LOCAL_FPR_PS1_BASE + fpr);
-    cache.fpr_ps1_loaded[fpr] = true;
-  }
+  EmitEnsureFPRLoaded(code, cache, fpr);
+  EmitLocalGet(code, LOCAL_FPR_V128_BASE + fpr);
+  EmitF64x2ExtractLane(code, 1);
 }
 
-// Store WASM stack top f64 to ps[fpr].ps0 cache (write-back, no state_ptr needed).
+// Store f64 from stack into ps[fpr].ps0 (replaces lane 0 in v128 cache).
+// Uses LOCAL_FPR0 as temp.
 static void EmitSetPS0Value(std::vector<u8>& code, GPRCache& cache, u32 fpr)
 {
-  EmitLocalSet(code, LOCAL_FPR_PS0_BASE + fpr);
-  cache.fpr_ps0_loaded[fpr] = true;
-  cache.fpr_ps0_dirty[fpr] = true;
+  EmitLocalSet(code, LOCAL_FPR0);  // save f64 to temp
+  EmitEnsureFPRLoaded(code, cache, fpr);
+  EmitLocalGet(code, LOCAL_FPR_V128_BASE + fpr);  // current v128
+  EmitLocalGet(code, LOCAL_FPR0);                   // f64 value
+  EmitF64x2ReplaceLane(code, 0);                    // v128 with new ps0
+  EmitLocalSet(code, LOCAL_FPR_V128_BASE + fpr);
+  cache.fpr_dirty[fpr] = true;
 }
 
-// Store WASM stack top f64 to ps[fpr].ps1 cache (write-back, no state_ptr needed).
+// Store f64 from stack into ps[fpr].ps1 (replaces lane 1 in v128 cache).
+// Uses LOCAL_FPR0 as temp.
 static void EmitSetPS1Value(std::vector<u8>& code, GPRCache& cache, u32 fpr)
 {
-  EmitLocalSet(code, LOCAL_FPR_PS1_BASE + fpr);
-  cache.fpr_ps1_loaded[fpr] = true;
-  cache.fpr_ps1_dirty[fpr] = true;
+  EmitLocalSet(code, LOCAL_FPR0);  // save f64 to temp
+  EmitEnsureFPRLoaded(code, cache, fpr);
+  EmitLocalGet(code, LOCAL_FPR_V128_BASE + fpr);
+  EmitLocalGet(code, LOCAL_FPR0);
+  EmitF64x2ReplaceLane(code, 1);
+  EmitLocalSet(code, LOCAL_FPR_V128_BASE + fpr);
+  cache.fpr_dirty[fpr] = true;
 }
 
 // Forward declaration
@@ -868,24 +952,17 @@ static void EmitFlushAllGPRs(std::vector<u8>& code, GPRCache& cache)
   }
 }
 
-// Flush all dirty FPR ps0/ps1 from cache locals back to PowerPCState memory.
+// Flush all dirty FPR v128 from cache locals back to PowerPCState memory.
 static void EmitFlushAllFPRs(std::vector<u8>& code, GPRCache& cache)
 {
   for (u32 i = 0; i < 32; i++)
   {
-    if (cache.fpr_ps0_dirty[i])
+    if (cache.fpr_dirty[i])
     {
       EmitLocalGet(code, LOCAL_STATE);
-      EmitLocalGet(code, LOCAL_FPR_PS0_BASE + i);
-      EmitF64Store(code, OFF_PS + i * 16);
-      cache.fpr_ps0_dirty[i] = false;
-    }
-    if (cache.fpr_ps1_dirty[i])
-    {
-      EmitLocalGet(code, LOCAL_STATE);
-      EmitLocalGet(code, LOCAL_FPR_PS1_BASE + i);
-      EmitF64Store(code, OFF_PS + i * 16 + 8);
-      cache.fpr_ps1_dirty[i] = false;
+      EmitLocalGet(code, LOCAL_FPR_V128_BASE + i);
+      EmitV128Store(code, OFF_PS + i * 16);
+      cache.fpr_dirty[i] = false;
     }
   }
 }
@@ -902,12 +979,8 @@ static void EmitFlushAll(std::vector<u8>& code, GPRCache& cache)
 // Call this AFTER the direct EmitI64Store to ps[fd], to prevent stale cache flush.
 static void InvalidateFPRDirect(GPRCache& cache, u32 fpr)
 {
-  cache.fpr_ps0_loaded[fpr] = false;
-  cache.fpr_ps0_dirty[fpr] = false;
-  // ps1 is at +8 in the same 16-byte slot; lfd loads overwrite ps0 only (ps1 undefined)
-  // but to be safe, invalidate ps1 as well
-  cache.fpr_ps1_loaded[fpr] = false;
-  cache.fpr_ps1_dirty[fpr] = false;
+  cache.fpr_loaded[fpr] = false;
+  cache.fpr_dirty[fpr] = false;
 }
 
 // Load CR field into WASM i64 local (with CR cache).
@@ -1845,6 +1918,77 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
 
   switch (opcode)
   {
+  case 3:  // twi: trap word immediate
+  {
+    const u32 TO = inst.TO;
+    const s32 imm = static_cast<s32>(inst.SIMM_16);
+
+    // Flush state before potential exception
+    EmitFlushAllGPRs(code, cache);
+    EmitFlushAllCR(code, cache);
+    EmitFlushAllFPRs(code, cache);
+
+    EmitGetGPRValue(code, cache, inst.RA);
+    EmitLocalSet(code, LOCAL_TMP1);  // a
+
+    // Build trap condition
+    EmitI32Const(code, 0);  // accumulator
+
+    if (TO & 0x10)  // a <s imm
+    {
+      EmitLocalGet(code, LOCAL_TMP1);
+      EmitI32Const(code, imm);
+      code.push_back(WasmOp::I32LtS);
+      code.push_back(WasmOp::I32Or);
+    }
+    if (TO & 0x08)  // a >s imm
+    {
+      EmitLocalGet(code, LOCAL_TMP1);
+      EmitI32Const(code, imm);
+      code.push_back(WasmOp::I32GtS);
+      code.push_back(WasmOp::I32Or);
+    }
+    if (TO & 0x04)  // a == imm
+    {
+      EmitLocalGet(code, LOCAL_TMP1);
+      EmitI32Const(code, imm);
+      code.push_back(WasmOp::I32Eq);
+      code.push_back(WasmOp::I32Or);
+    }
+    if (TO & 0x02)  // a <u imm
+    {
+      EmitLocalGet(code, LOCAL_TMP1);
+      EmitI32Const(code, imm);
+      code.push_back(WasmOp::I32LtU);
+      code.push_back(WasmOp::I32Or);
+    }
+    if (TO & 0x01)  // a >u imm
+    {
+      EmitLocalGet(code, LOCAL_TMP1);
+      EmitI32Const(code, imm);
+      code.push_back(WasmOp::I32GtU);
+      code.push_back(WasmOp::I32Or);
+    }
+
+    code.push_back(WasmOp::If);
+    code.push_back(WasmOp::Void);
+    {
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitI32Const(code, static_cast<s32>(op.address));
+      EmitI32Store(code, OFF_PC);
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitI32Load(code, OFF_EXCEPTIONS);
+      EmitI32Const(code, 0x80);  // EXCEPTION_PROGRAM
+      code.push_back(WasmOp::I32Or);
+      EmitI32Store(code, OFF_EXCEPTIONS);
+      EmitI32Const(code, 0);
+      code.push_back(WasmOp::Return);
+    }
+    code.push_back(WasmOp::End);
+    return true;
+  }
+
   case 8:  // subfic: rd = SIMM - gpr[ra], CA = carry (unsigned borrow)
   {
     if (cache.is_const[inst.RA])
@@ -2873,6 +3017,17 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
           EmitUpdateCR0(code, cache);
       }
       return true;
+
+    case 83:  // mfmsr: rd = MSR
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitI32Load(code, OFF_MSR);
+      EmitSetGPRValue(code, cache, inst.RD);
+      return true;
+
+    case 146:  // mtmsr: MSR = gpr[rs]
+      // Updating MSR is a context-changing operation (MMU, interrupts).
+      // Explicitly fallback to interpreter.
+      return false;
 
     case 28:  // and: ra = gpr[rs] & gpr[rb]
       if (cache.is_const[inst.RS] && cache.is_const[inst.RB])
@@ -3963,8 +4118,45 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
     case 339:  // mfspr: rd = SPR[spr]
     {
       const u32 spr = ((inst.hex >> 16) & 0x1f) | ((inst.hex >> 6) & 0x3e0);
+
+      if (spr == 1)  // XER: reconstruct from split fields
+      {
+        // xer = xer_stringctrl | (xer_ca << 29) | (xer_so_ov << 30)
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitI32Load16U(code, OFF_XER_STRINGCTRL);
+
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitI32Load8U(code, OFF_XER_CA);
+        EmitI32Const(code, 29);
+        code.push_back(WasmOp::I32Shl);
+        code.push_back(WasmOp::I32Or);
+
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitI32Load8U(code, OFF_XER_SO_OV);
+        EmitI32Const(code, 30);
+        code.push_back(WasmOp::I32Shl);
+        code.push_back(WasmOp::I32Or);
+
+        EmitSetGPRValue(code, cache, inst.RD);
+        return true;
+      }
+
+      // Direct SPR reads: LR, CTR, GQR0-7, DSISR, DAR, DEC, SRR0, SRR1,
+      // SPRG0-3, HID0, HID2, TBL, TBU, and others
       if (spr == SPR_LR_IDX || spr == SPR_CTR_IDX ||
-          (spr >= 912 && spr <= 919))
+          (spr >= 912 && spr <= 919) ||  // GQR0-7
+          spr == 18 || spr == 19 ||       // DSISR, DAR
+          spr == 22 ||                    // DEC
+          spr == 25 ||                    // SDR1
+          spr == 26 || spr == 27 ||       // SRR0, SRR1
+          (spr >= 272 && spr <= 275) ||   // SPRG0-3
+          spr == 1008 || spr == 1009 ||   // HID0, HID1
+          spr == 920 ||                   // HID2
+          spr == 921 ||                   // WPAR
+          spr == 268 || spr == 269 ||     // TBL, TBU
+          spr == 952 || spr == 956 ||     // MMCR0, MMCR1
+          spr == 953 || spr == 954 ||     // PMC1, PMC2
+          spr == 957 || spr == 958)       // PMC3, PMC4
       {
         EmitLocalGet(code, LOCAL_STATE);
         EmitI32Load(code, OFF_SPR + spr * 4);
@@ -3988,8 +4180,48 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
     case 467:  // mtspr: SPR[spr] = gpr[rs]
     {
       const u32 spr = ((inst.hex >> 16) & 0x1f) | ((inst.hex >> 6) & 0x3e0);
+
+      if (spr == 1)  // XER: split into component fields
+      {
+        // xer_stringctrl = val & 0xFFFF
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitGetGPRValue(code, cache, inst.RS);
+        EmitI32Const(code, 0xFFFF);
+        code.push_back(WasmOp::I32And);
+        EmitI32Store16(code, OFF_XER_STRINGCTRL);
+        // xer_ca = (val >> 29) & 1
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitGetGPRValue(code, cache, inst.RS);
+        EmitI32Const(code, 29);
+        code.push_back(WasmOp::I32ShrU);
+        EmitI32Const(code, 1);
+        code.push_back(WasmOp::I32And);
+        EmitI32Store8(code, OFF_XER_CA);
+        // xer_so_ov = (val >> 30) & 3
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitGetGPRValue(code, cache, inst.RS);
+        EmitI32Const(code, 30);
+        code.push_back(WasmOp::I32ShrU);
+        EmitI32Const(code, 3);
+        code.push_back(WasmOp::I32And);
+        EmitI32Store8(code, OFF_XER_SO_OV);
+        return true;
+      }
+
+      // Direct SPR writes
       if (spr == SPR_LR_IDX || spr == SPR_CTR_IDX ||
-          (spr >= 912 && spr <= 919))
+          (spr >= 912 && spr <= 919) ||  // GQR0-7
+          spr == 18 || spr == 19 ||       // DSISR, DAR
+          spr == 22 ||                    // DEC
+          spr == 25 ||                    // SDR1
+          spr == 26 || spr == 27 ||       // SRR0, SRR1
+          (spr >= 272 && spr <= 275) ||   // SPRG0-3
+          spr == 1008 || spr == 1009 ||   // HID0, HID1
+          spr == 920 ||                   // HID2
+          spr == 921 ||                   // WPAR
+          spr == 952 || spr == 956 ||     // MMCR0, MMCR1
+          spr == 953 || spr == 954 ||     // PMC1, PMC2
+          spr == 957 || spr == 958)       // PMC3, PMC4
       {
         EmitLocalGet(code, LOCAL_STATE);
         EmitGetGPRValue(code, cache, inst.RS);
@@ -4077,55 +4309,34 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
       return true;
     }
 
-    case 234:  // addme: rd = gpr[ra] + CA - 1
+    case 234:  // addme: rd = gpr[ra] + CA - 1 (= ra + CA + 0xFFFFFFFF)
     {
-      // result = ra + CA + 0xFFFFFFFF = ra + CA - 1
+      // Use i64 arithmetic for correct carry detection
       EmitGetGPRValue(code, cache, inst.RA);
-      EmitLocalSet(code, LOCAL_TMP1);  // a
-
-      EmitLocalGet(code, LOCAL_TMP1);
+      code.push_back(WasmOp::I64ExtendI32U);
       EmitLocalGet(code, LOCAL_STATE);
       EmitI32Load8U(code, OFF_XER_CA);
-      code.push_back(WasmOp::I32Add);
-      EmitI32Const(code, -1);
-      code.push_back(WasmOp::I32Add);
-      EmitLocalSet(code, LOCAL_TMP2);  // result
+      code.push_back(WasmOp::I64ExtendI32U);
+      code.push_back(WasmOp::I64Add);
+      EmitI64Const(code, 0xFFFFFFFF);
+      code.push_back(WasmOp::I64Add);
+      EmitLocalSet(code, LOCAL_CR64);
 
-      EmitLocalGet(code, LOCAL_TMP2);
+      EmitLocalGet(code, LOCAL_CR64);
+      code.push_back(WasmOp::I32WrapI64);
+      EmitLocalTee(code, LOCAL_TMP1);
       EmitSetGPRValue(code, cache, inst.RD);
 
-      // CA = carry out of ~a + CA (where the full op is ~a + 0xFFFFFFFF + CA + 1)
-      // Simplified: CA = (a != 0) || (old_CA != 0) when a == 0xFFFFFFFF
-      // Actually: CA = Helper_Carry(a, old_ca-1) || old_ca
-      // Correct formula: CA = (result >= a) when old_ca was 0,
-      //                  or (result > a) || (result == a && ca was 1)
-      // Simplest correct: treat as a + (CA - 1), CA_new = carry of a + CA_neg
-      // where CA_neg = old_CA + 0xFFFFFFFF
-      // CA = (a+CA_neg) < a if CA_neg != 0, or just 0 if CA_neg == 0 and no overflow
-      // Actually the interpreter just does:
-      // carry = Helper_Carry(a, carry-1)  where carry is 0 or 1
-      // if old_carry == 1: carry |= (a == 0xFFFFFFFF)
-      // Simplification: if old_ca==0: result = a-1, CA = (a != 0)
-      //                 if old_ca==1: result = a, CA = 1 iff a==0xFFFFFFFF... no
-      // Let me use: CA = (old_ca && a == 0xFFFFFFFF) || (!old_ca && a != 0)
-      // Hmm this is wrong. Let me just do the actual carry check:
-      // CA = ((u32)(a + ca_val) < a) || (ca_val != 0 && (u32)(a + ca_val) == a)
-      // Simpler: the sum before -1 is a + CA. If this overflows, carry. Then -1 can't un-overflow.
-      // CA = (a + old_CA) < a (unsigned) when old_CA=0, always false
-      // CA = (a + old_CA) < a (unsigned) when old_CA=1, true iff a==0xFFFFFFFF -> a+1 wraps to 0
-      // But we also add 0xFFFFFFFF. Total: a + CA + 0xFFFFFFFF
-      // Full carry: CA = (a == 0xFFFFFFFF && old_CA) || (a + old_CA != 0)
-      // Wait no. Let me just use: CA = ~(result == 0xFFFFFFFF && old_CA == 0)
-      // Hmm let me just fall back for this one
+      // CA = (result >> 32) & 1
       EmitLocalGet(code, LOCAL_STATE);
-      EmitI32Const(code, 0);
-      EmitI32Store8(code, OFF_XER_CA);  // approximate: CA = 0
+      EmitLocalGet(code, LOCAL_CR64);
+      EmitI64Const(code, 32);
+      code.push_back(WasmOp::I64ShrU);
+      code.push_back(WasmOp::I32WrapI64);
+      EmitI32Store8(code, OFF_XER_CA);
+
       if (inst.Rc && !cache.skip_cr0)
-      {
-        EmitLocalGet(code, LOCAL_TMP2);
-        EmitLocalSet(code, LOCAL_TMP1);
         EmitUpdateCR0(code, cache);
-      }
       return true;
     }
 
@@ -4767,6 +4978,249 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
       EmitBswap16(code);
       EmitLocalSet(code, LOCAL_TMP1);
       EmitDirectStore(code, 2, m_ram_base, m_exram_base, m_ram_mask, m_exram_mask, FUNC_WRITE_U16);
+      return true;
+    }
+
+    // =================================================================
+    // Additional cache/sync NOPs not already covered above
+    // =================================================================
+    case 470:  // dcbi: data cache block invalidate — NOP
+    case 758:  // dcba: data cache block allocate — NOP
+      return true;
+
+    // =================================================================
+    // subfze, subfme: carry-dependent arithmetic not covered above
+    // =================================================================
+    case 232:  // subfze: rd = ~gpr[ra] + CA, CA = carry
+    {
+      EmitGetGPRValue(code, cache, inst.RA);
+      EmitI32Const(code, -1);
+      code.push_back(WasmOp::I32Xor);  // ~ra
+      code.push_back(WasmOp::I64ExtendI32U);
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitI32Load8U(code, OFF_XER_CA);
+      code.push_back(WasmOp::I64ExtendI32U);
+      code.push_back(WasmOp::I64Add);
+      EmitLocalSet(code, LOCAL_CR64);
+
+      EmitLocalGet(code, LOCAL_CR64);
+      code.push_back(WasmOp::I32WrapI64);
+      EmitLocalTee(code, LOCAL_TMP1);
+      EmitSetGPRValue(code, cache, inst.RD);
+
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitLocalGet(code, LOCAL_CR64);
+      EmitI64Const(code, 32);
+      code.push_back(WasmOp::I64ShrU);
+      code.push_back(WasmOp::I32WrapI64);
+      EmitI32Store8(code, OFF_XER_CA);
+
+      if (inst.Rc && !cache.skip_cr0)
+        EmitUpdateCR0(code, cache);
+      return true;
+    }
+
+    case 200:  // subfme: rd = ~gpr[ra] + CA - 1, CA = carry
+    {
+      EmitGetGPRValue(code, cache, inst.RA);
+      EmitI32Const(code, -1);
+      code.push_back(WasmOp::I32Xor);  // ~ra
+      code.push_back(WasmOp::I64ExtendI32U);
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitI32Load8U(code, OFF_XER_CA);
+      code.push_back(WasmOp::I64ExtendI32U);
+      code.push_back(WasmOp::I64Add);
+      EmitI64Const(code, 0xFFFFFFFF);
+      code.push_back(WasmOp::I64Add);
+      EmitLocalSet(code, LOCAL_CR64);
+
+      EmitLocalGet(code, LOCAL_CR64);
+      code.push_back(WasmOp::I32WrapI64);
+      EmitLocalTee(code, LOCAL_TMP1);
+      EmitSetGPRValue(code, cache, inst.RD);
+
+      EmitLocalGet(code, LOCAL_STATE);
+      EmitLocalGet(code, LOCAL_CR64);
+      EmitI64Const(code, 32);
+      code.push_back(WasmOp::I64ShrU);
+      code.push_back(WasmOp::I32WrapI64);
+      EmitI32Store8(code, OFF_XER_CA);
+
+      if (inst.Rc && !cache.skip_cr0)
+        EmitUpdateCR0(code, cache);
+      return true;
+    }
+
+    // =================================================================
+    // Trap instruction (tw): conditional program exception
+    // =================================================================
+    case 4:  // tw: trap word
+    {
+      // Compare gpr[ra] and gpr[rb] using TO conditions
+      const u32 TO = inst.TO;
+
+      // Flush state before potential exception
+      EmitFlushAllGPRs(code, cache);
+      EmitFlushAllCR(code, cache);
+      EmitFlushAllFPRs(code, cache);
+
+      EmitGetGPRValue(code, cache, inst.RA);
+      EmitLocalSet(code, LOCAL_TMP1);  // a
+      EmitGetGPRValue(code, cache, inst.RB);
+      EmitLocalSet(code, LOCAL_TMP2);  // b
+
+      // Build trap condition: any matching TO bit triggers trap
+      EmitI32Const(code, 0);  // accumulator
+
+      if (TO & 0x10)  // a <s b
+      {
+        EmitLocalGet(code, LOCAL_TMP1);
+        EmitLocalGet(code, LOCAL_TMP2);
+        code.push_back(WasmOp::I32LtS);
+        code.push_back(WasmOp::I32Or);
+      }
+      if (TO & 0x08)  // a >s b
+      {
+        EmitLocalGet(code, LOCAL_TMP1);
+        EmitLocalGet(code, LOCAL_TMP2);
+        code.push_back(WasmOp::I32GtS);
+        code.push_back(WasmOp::I32Or);
+      }
+      if (TO & 0x04)  // a == b
+      {
+        EmitLocalGet(code, LOCAL_TMP1);
+        EmitLocalGet(code, LOCAL_TMP2);
+        code.push_back(WasmOp::I32Eq);
+        code.push_back(WasmOp::I32Or);
+      }
+      if (TO & 0x02)  // a <u b
+      {
+        EmitLocalGet(code, LOCAL_TMP1);
+        EmitLocalGet(code, LOCAL_TMP2);
+        code.push_back(WasmOp::I32LtU);
+        code.push_back(WasmOp::I32Or);
+      }
+      if (TO & 0x01)  // a >u b
+      {
+        EmitLocalGet(code, LOCAL_TMP1);
+        EmitLocalGet(code, LOCAL_TMP2);
+        code.push_back(WasmOp::I32GtU);
+        code.push_back(WasmOp::I32Or);
+      }
+
+      // If trap condition met, set EXCEPTION_PROGRAM and stop block
+      code.push_back(WasmOp::If);
+      code.push_back(WasmOp::Void);
+      {
+        // Set PC
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitI32Const(code, static_cast<s32>(op.address));
+        EmitI32Store(code, OFF_PC);
+        // Set Exceptions |= PROGRAM (0x80)
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitLocalGet(code, LOCAL_STATE);
+        EmitI32Load(code, OFF_EXCEPTIONS);
+        EmitI32Const(code, 0x80);
+        code.push_back(WasmOp::I32Or);
+        EmitI32Store(code, OFF_EXCEPTIONS);
+        // Return 0 to stop chain
+        EmitI32Const(code, 0);
+        code.push_back(WasmOp::Return);
+      }
+      code.push_back(WasmOp::End);
+      return true;
+    }
+
+    // =================================================================
+    // String load/store instructions
+    // =================================================================
+    case 597:  // lswi: load string word immediate
+    {
+      // EA = (RA == 0) ? 0 : gpr[RA]
+      // NB = (inst.NB == 0) ? 32 : inst.NB
+      // Load NB bytes starting from EA into registers starting at RD
+      const u32 nb = (inst.NB == 0) ? 32 : inst.NB;
+
+      if (inst.RA != 0)
+      {
+        EmitGetGPRValue(code, cache, inst.RA);
+      }
+      else
+      {
+        EmitI32Const(code, 0);
+      }
+      EmitLocalSet(code, LOCAL_TMP2);  // base EA (preserved)
+
+      u32 r = inst.RD;
+      u32 bytes_loaded = 0;
+      while (bytes_loaded < nb)
+      {
+        // Start of a new register: zero it
+        EmitI32Const(code, 0);
+        EmitSetGPRValue(code, cache, r);
+
+        // Load up to 4 bytes into this register (MSB first = big-endian)
+        for (u32 byte_in_reg = 0; byte_in_reg < 4 && bytes_loaded < nb; byte_in_reg++, bytes_loaded++)
+        {
+          // Read byte from memory at base_EA + bytes_loaded
+          EmitLocalGet(code, LOCAL_TMP2);
+          if (bytes_loaded != 0)
+          {
+            EmitI32Const(code, static_cast<s32>(bytes_loaded));
+            code.push_back(WasmOp::I32Add);
+          }
+          EmitCall(code, FUNC_READ_U8);
+          // Shift into position: byte 0 goes to bits 24-31, byte 1 to 16-23, etc.
+          EmitI32Const(code, static_cast<s32>((3 - byte_in_reg) * 8));
+          code.push_back(WasmOp::I32Shl);
+          // OR into register
+          EmitGetGPRValue(code, cache, r);
+          code.push_back(WasmOp::I32Or);
+          EmitSetGPRValue(code, cache, r);
+        }
+        r = (r + 1) & 31;
+      }
+      return true;
+    }
+
+    case 725:  // stswi: store string word immediate
+    {
+      const u32 nb = (inst.NB == 0) ? 32 : inst.NB;
+
+      if (inst.RA != 0)
+      {
+        EmitGetGPRValue(code, cache, inst.RA);
+      }
+      else
+      {
+        EmitI32Const(code, 0);
+      }
+      EmitLocalSet(code, LOCAL_EA);
+
+      u32 r = inst.RS;
+      u32 bytes_stored = 0;
+      while (bytes_stored < nb)
+      {
+        for (u32 byte_in_reg = 0; byte_in_reg < 4 && bytes_stored < nb; byte_in_reg++, bytes_stored++)
+        {
+          // Compute target address
+          EmitLocalGet(code, LOCAL_EA);
+          if (bytes_stored != 0)
+          {
+            EmitI32Const(code, static_cast<s32>(bytes_stored));
+            code.push_back(WasmOp::I32Add);
+          }
+          // Extract byte from register: (gpr[r] >> ((3 - byte_in_reg) * 8)) & 0xFF
+          EmitGetGPRValue(code, cache, r);
+          EmitI32Const(code, static_cast<s32>((3 - byte_in_reg) * 8));
+          code.push_back(WasmOp::I32ShrU);
+          EmitI32Const(code, 0xFF);
+          code.push_back(WasmOp::I32And);
+          // Call write_u8(addr, value)
+          EmitCall(code, FUNC_WRITE_U8);
+        }
+        r = (r + 1) & 31;
+      }
       return true;
     }
 
@@ -6137,78 +6591,78 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
     const u32 subop10 = inst.SUBOP10;
     switch (subop10)
     {
-    case 72:  // ps_mr: fd = fb (both ps0 and ps1)
-      EmitLoadPS0(code, cache, inst.FB);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLoadPS1(code, cache, inst.FB);
-      EmitSetPS1Value(code, cache, inst.FD);
+    case 72:  // ps_mr: fd = fb (copy full v128)
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
 
-    case 40:  // ps_neg: fd = -fb
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Neg);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Neg);
-      EmitSetPS1Value(code, cache, inst.FD);
+    case 40:  // ps_neg: fd = -fb (SIMD f64x2.neg)
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Neg);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
 
-    case 264:  // ps_abs: fd = |fb|
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Abs);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Abs);
-      EmitSetPS1Value(code, cache, inst.FD);
+    case 264:  // ps_abs: fd = |fb| (SIMD f64x2.abs)
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Abs);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
 
-    case 136:  // ps_nabs: fd = -|fb|
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Abs);
-      code.push_back(WasmOp::F64Neg);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Abs);
-      code.push_back(WasmOp::F64Neg);
-      EmitSetPS1Value(code, cache, inst.FD);
+    case 136:  // ps_nabs: fd = -|fb| (SIMD f64x2.abs + f64x2.neg)
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Abs);
+      EmitSIMDOp(code, WasmOp::F64x2Neg);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
 
     case 528:  // ps_merge00: fd.ps0 = fa.ps0, fd.ps1 = fb.ps0
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLoadPS0(code, cache, inst.FB);
-      EmitSetPS1Value(code, cache, inst.FD);
+    {
+      // i8x16.shuffle: take bytes 0-7 from fa (ps0), bytes 0-7 from fb (ps0 → lane 1)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, 0x0d);  // i8x16.shuffle
+      // Indices: fa[0..7], fb[0..7] (fb is at offset 16 in the concatenated view)
+      const u8 shuffle00[] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
+      code.insert(code.end(), shuffle00, shuffle00 + 16);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
+    }
 
     case 560:  // ps_merge01: fd.ps0 = fa.ps0, fd.ps1 = fb.ps1
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLoadPS1(code, cache, inst.FB);
-      EmitSetPS1Value(code, cache, inst.FD);
+    {
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, 0x0d);  // i8x16.shuffle
+      // fa[0..7] (ps0), fb[8..15] (ps1, at offset 16+8=24)
+      const u8 shuffle01[] = {0,1,2,3,4,5,6,7, 24,25,26,27,28,29,30,31};
+      code.insert(code.end(), shuffle01, shuffle01 + 16);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
+    }
 
     case 592:  // ps_merge10: fd.ps0 = fa.ps1, fd.ps1 = fb.ps0
-      // Need to read both before writing (in case fd == fa or fd == fb)
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS0(code, cache, inst.FB);
-      EmitLocalSet(code, LOCAL_FPR1);
-      EmitLocalGet(code, LOCAL_FPR0);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLocalGet(code, LOCAL_FPR1);
-      EmitSetPS1Value(code, cache, inst.FD);
+    {
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, 0x0d);  // i8x16.shuffle
+      // fa[8..15] (ps1), fb[0..7] (ps0, at offset 16)
+      const u8 shuffle10[] = {8,9,10,11,12,13,14,15, 16,17,18,19,20,21,22,23};
+      code.insert(code.end(), shuffle10, shuffle10 + 16);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
+    }
 
     case 624:  // ps_merge11: fd.ps0 = fa.ps1, fd.ps1 = fb.ps1
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FB);
-      EmitLocalSet(code, LOCAL_FPR1);
-      EmitLocalGet(code, LOCAL_FPR0);
-      EmitSetPS0Value(code, cache, inst.FD);
-      EmitLocalGet(code, LOCAL_FPR1);
-      EmitSetPS1Value(code, cache, inst.FD);
+    {
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, 0x0d);  // i8x16.shuffle
+      // fa[8..15] (ps1), fb[8..15] (ps1, at offset 16+8=24)
+      const u8 shuffle11[] = {8,9,10,11,12,13,14,15, 24,25,26,27,28,29,30,31};
+      code.insert(code.end(), shuffle11, shuffle11 + 16);
+      EmitSetFPRv128(code, cache, inst.FD);
       return true;
+    }
 
     default:
       break;  // fall through to SUBOP5 check
@@ -6220,181 +6674,106 @@ bool AotWasm::TryEmitWasmInstruction(std::vector<u8>& code, const PPCAnalyst::Co
     // PS arithmetic: operate on both ps0 and ps1, round to single
     switch (subop5)
     {
-    case 21:  // ps_add
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Add);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Add);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    // --- SIMD v128 paired-single arithmetic (symmetric: both lanes identical) ---
+    case 21:  // ps_add: fd = fa + fb (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Add);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 20:  // ps_sub
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sub);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sub);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 20:  // ps_sub: fd = fa - fb (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Sub);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 25:  // ps_mul
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 25:  // ps_mul: fd = fa * fc (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FC);
+      EmitSIMDOp(code, WasmOp::F64x2Mul);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 18:  // ps_div
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Div);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Div);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 18:  // ps_div: fd = fa / fb (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Div);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 29:  // ps_madd: fd = fa * fc + fb
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Add);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Add);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 29:  // ps_madd: fd = fa * fc + fb (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FC);
+      EmitSIMDOp(code, WasmOp::F64x2Mul);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Add);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 28:  // ps_msub: fd = fa * fc - fb
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sub);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sub);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 28:  // ps_msub: fd = fa * fc - fb (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FC);
+      EmitSIMDOp(code, WasmOp::F64x2Mul);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Sub);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 31:  // ps_nmadd: fd = -(fa * fc + fb)
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Add);
-      code.push_back(WasmOp::F64Neg);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Add);
-      code.push_back(WasmOp::F64Neg);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 31:  // ps_nmadd: fd = -(fa * fc + fb) (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FC);
+      EmitSIMDOp(code, WasmOp::F64x2Mul);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Add);
+      EmitSIMDOp(code, WasmOp::F64x2Neg);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 30:  // ps_nmsub: fd = -(fa * fc - fb)
-      EmitLoadPS0(code, cache, inst.FA);
-      EmitLoadPS0(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sub);
-      code.push_back(WasmOp::F64Neg);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitLoadPS1(code, cache, inst.FA);
-      EmitLoadPS1(code, cache, inst.FC);
-      code.push_back(WasmOp::F64Mul);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sub);
-      code.push_back(WasmOp::F64Neg);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+    case 30:  // ps_nmsub: fd = -(fa * fc - fb) (SIMD)
+      EmitLoadFPRv128(code, cache, inst.FA);
+      EmitLoadFPRv128(code, cache, inst.FC);
+      EmitSIMDOp(code, WasmOp::F64x2Mul);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Sub);
+      EmitSIMDOp(code, WasmOp::F64x2Neg);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
 
-    case 24:  // ps_res: fd = 1.0 / fb
+    case 24:  // ps_res: fd = 1.0 / fb (SIMD: splat 1.0, div)
+    {
+      // Build v128 of [1.0, 1.0] via f64x2.splat
       EmitI64Const(code, static_cast<s64>(0x3FF0000000000000ULL));
       code.push_back(WasmOp::F64ReinterpretI64);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Div);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitI64Const(code, static_cast<s64>(0x3FF0000000000000ULL));
-      code.push_back(WasmOp::F64ReinterpretI64);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Div);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+      EmitSIMDOp(code, WasmOp::F64x2Splat);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Div);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
+    }
 
-    case 26:  // ps_rsqrte: fd = 1.0 / sqrt(fb)
+    case 26:  // ps_rsqrte: fd = 1.0 / sqrt(fb) (SIMD)
+    {
       EmitI64Const(code, static_cast<s64>(0x3FF0000000000000ULL));
       code.push_back(WasmOp::F64ReinterpretI64);
-      EmitLoadPS0(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sqrt);
-      code.push_back(WasmOp::F64Div);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR0);
-      EmitI64Const(code, static_cast<s64>(0x3FF0000000000000ULL));
-      code.push_back(WasmOp::F64ReinterpretI64);
-      EmitLoadPS1(code, cache, inst.FB);
-      code.push_back(WasmOp::F64Sqrt);
-      code.push_back(WasmOp::F64Div);
-      code.push_back(WasmOp::F32DemoteF64);
-      code.push_back(WasmOp::F64PromoteF32);
-      EmitLocalSet(code, LOCAL_FPR1);
-      break;
+      EmitSIMDOp(code, WasmOp::F64x2Splat);
+      EmitLoadFPRv128(code, cache, inst.FB);
+      EmitSIMDOp(code, WasmOp::F64x2Sqrt);
+      EmitSIMDOp(code, WasmOp::F64x2Div);
+      EmitF64x2RoundToF32(code);
+      EmitSetFPRv128(code, cache, inst.FD);
+      return true;
+    }
 
     case 10:  // ps_sum0: fd.ps0 = fa.ps0 + fb.ps1, fd.ps1 = fc.ps1
       EmitLoadPS0(code, cache, inst.FA);
@@ -7285,19 +7664,21 @@ void AotWasm::BuildWasmModuleBytes(std::vector<u8>& out, u32 block_address, u32 
     // Local declarations layout (CR before FPR so FPR can be omitted for integer-only blocks):
     //   1-5: i32 (tmp1, tmp2, tmp3, ea, nibble)
     //   6: i64 (cr64)
-    //   7-8: f64 (fpr0, fpr1)
+    //   7-8: f64 (fpr0, fpr1)  -- scalar FPU temps
     //   9-40: i32 (32 GPR cache)
     //   41-48: i64 (8 CR field cache)
-    //   49-112: f64 (64 FPR ps0/ps1 cache) -- only for FPU blocks
+    //   49-80: v128 (32 FPR v128 cache) -- only for FPU blocks
+    //   81-82: v128 (2 SIMD temp locals) -- only for FPU blocks
     if (has_fpu)
     {
-      EncodeU32(body, 6);   // 6 local declaration groups
+      EncodeU32(body, 7);   // 7 local declaration groups
       EncodeU32(body, 5);   body.push_back(WasmOp::I32);   // 5 i32 temps
       EncodeU32(body, 1);   body.push_back(WasmOp::I64);   // 1 i64 cr64
-      EncodeU32(body, 2);   body.push_back(WasmOp::F64);   // 2 f64 fpr temps
+      EncodeU32(body, 2);   body.push_back(WasmOp::F64);   // 2 f64 scalar FPU temps
       EncodeU32(body, 32);  body.push_back(WasmOp::I32);   // 32 i32 GPR cache
       EncodeU32(body, 8);   body.push_back(WasmOp::I64);   // 8 i64 CR cache
-      EncodeU32(body, 64);  body.push_back(WasmOp::F64);   // 64 f64 FPR ps0/ps1 cache
+      EncodeU32(body, 32);  body.push_back(WasmOp::V128);  // 32 v128 FPR cache
+      EncodeU32(body, 2);   body.push_back(WasmOp::V128);  // 2 v128 SIMD temps
     }
     else
     {
@@ -7308,7 +7689,7 @@ void AotWasm::BuildWasmModuleBytes(std::vector<u8>& out, u32 block_address, u32 
       EncodeU32(body, 32);  body.push_back(WasmOp::I32);   // 32 i32 GPR cache
       // CR cache follows GPR at index 41 (same as FPU path)
       EncodeU32(body, 8);   body.push_back(WasmOp::I64);   // 8 i64 CR cache
-      // No FPR locals: saves 64 f64 declarations
+      // No FPR/SIMD locals: saves space for integer-only blocks
     }
 
     // If block has FPU instructions, emit inline MSR.FP check at the start.
@@ -7391,19 +7772,15 @@ void AotWasm::BuildWasmModuleBytes(std::vector<u8>& out, u32 block_address, u32 
         EmitLocalSet(body, LOCAL_GPR_BASE + r);
         gpr_cache.loaded[r] = true;
       }
-      // Also pre-load FPRs if the block uses FPU instructions
+      // Also pre-load FPRs as v128 if the block uses FPU instructions
       if (has_fpu)
       {
         for (u32 r = 0; r < 32; r++)
         {
           EmitLocalGet(body, LOCAL_STATE);
-          EmitF64Load(body, OFF_PS + r * 16);
-          EmitLocalSet(body, LOCAL_FPR_PS0_BASE + r);
-          gpr_cache.fpr_ps0_loaded[r] = true;
-          EmitLocalGet(body, LOCAL_STATE);
-          EmitF64Load(body, OFF_PS + r * 16 + 8);
-          EmitLocalSet(body, LOCAL_FPR_PS1_BASE + r);
-          gpr_cache.fpr_ps1_loaded[r] = true;
+          EmitV128Load(body, OFF_PS + r * 16);
+          EmitLocalSet(body, LOCAL_FPR_V128_BASE + r);
+          gpr_cache.fpr_loaded[r] = true;
         }
       }
       body.push_back(WasmOp::Loop);
@@ -7436,24 +7813,67 @@ void AotWasm::BuildWasmModuleBytes(std::vector<u8>& out, u32 block_address, u32 
 
       if (!emitted)
       {
-        // Selective flush: only flush register classes the interpreter might read.
-        // Non-FPU instructions don't touch FPR, so skip the expensive FPR flush.
+        // Fallback batching: if this is NOT a canEndBlock instruction, look ahead
+        // and collect consecutive fallback instructions to batch them under a single
+        // register flush, reducing the overhead of WASM↔C++ transitions.
+        u32 batch_end = i;
+        bool batch_has_fpu_flag = (op.opinfo->flags & FL_USE_FPU) != 0;
+        bool batch_has_loadstore = (op.opinfo->flags & FL_LOADSTORE) != 0;
+
+        if (!is_can_end)
+        {
+          // Look ahead for more consecutive non-canEndBlock fallbacks
+          for (u32 j = i + 1; j < num_instructions; j++)
+          {
+            const PPCAnalyst::CodeOp& next_op = m_code_buffer[j];
+            if (next_op.skip)
+              continue;
+            if (next_op.canEndBlock)
+              break;
+            // Check if it would also fail to emit natively (peek: don't modify state)
+            // We can't easily peek TryEmitWasmInstruction without side effects,
+            // so just batch up to 8 consecutive instructions at most
+            if (j - i >= 8)
+              break;
+            // Create a temporary cache copy to test emission
+            GPRCache test_cache = gpr_cache;
+            std::vector<u8> test_code;
+            if (TryEmitWasmInstruction(test_code, next_op, test_cache))
+              break;  // Next instruction can be natively emitted, stop batch
+            // Include this instruction in the batch
+            batch_end = j;
+            if (next_op.opinfo->flags & FL_USE_FPU)
+              batch_has_fpu_flag = true;
+            if (next_op.opinfo->flags & FL_LOADSTORE)
+              batch_has_loadstore = true;
+          }
+        }
+
+        // Single flush for the entire batch
         EmitFlushAllGPRs(body, gpr_cache);
         EmitFlushAllCR(body, gpr_cache);
-        if (op.opinfo->flags & FL_USE_FPU)
+        if (batch_has_fpu_flag)
           EmitFlushAllFPRs(body, gpr_cache);
-        // Invalidate cache (interpreter may modify any register in its class)
         gpr_cache.Invalidate();
 
-        // Use interpreter fallback
-        EmitWasmFallback(body, op.address, op.inst.hex);
-      }
+        // Emit fallback calls for all batched instructions
+        for (u32 k = i; k <= batch_end; k++)
+        {
+          const PPCAnalyst::CodeOp& batch_op = m_code_buffer[k];
+          if (batch_op.skip)
+            continue;
+          EmitWasmFallback(body, batch_op.address, batch_op.inst.hex);
+        }
 
-      // Check exceptions for fallback load/store instructions
-      // (natively-emitted loads/stores already have inline exception checks)
-      if (!emitted && (op.opinfo->flags & FL_LOADSTORE))
-      {
-        EmitWasmExceptionCheck(body);
+        // Single exception check at end of batch (covers all load/stores)
+        if (batch_has_loadstore)
+        {
+          EmitWasmExceptionCheck(body);
+        }
+
+        // Advance loop past batched instructions
+        if (batch_end > i)
+          i = batch_end;
       }
 
       // For canEndBlock fallback: interpreter wrote npc to state memory, reload into LOCAL_NPC

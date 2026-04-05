@@ -83,6 +83,13 @@ if(WIN32)
   )
 endif()
 
+if(EMSCRIPTEN)
+  target_sources(audiocommon PRIVATE
+    WebAudioStream.cpp
+    WebAudioStream.h
+  )
+endif()
+
 target_link_libraries(audiocommon
 PUBLIC
   common

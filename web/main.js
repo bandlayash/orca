@@ -1,4 +1,9 @@
 var Module = {
+  // The canvas element is registered here so that Emscripten can transfer it as
+  // an OffscreenCanvas to the GPU worker thread (dual-core mode).  The linker
+  // flags -sOFFSCREENCANVAS_SUPPORT=1 and -sOFFSCREENCANVASES_TO_PTHREAD='#canvas' tell
+  // the runtime to perform the transfer when the GPU thread creates a WebGL
+  // context on "#canvas".
   canvas: document.getElementById('canvas'),
   onDolphinReady: function() {
     document.getElementById('rom-input').disabled = false;
